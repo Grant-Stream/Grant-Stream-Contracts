@@ -12,6 +12,14 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        working-directory:
+          - .
+          - ./contracts/vesting_contracts
+    defaults:
+      run:
+        working-directory: ${{ matrix.working-directory }}
     steps:
       - uses: actions/checkout@v3
       
@@ -37,4 +45,7 @@ jobs:
         run: cargo build --target wasm32-unknown-unknown --release
 
       - name: Run Unit Tests
-        run: cargo test
+        run: cargo test --lib
+
+      - name: Run Integration Tests
+        run: cargo test --test '*'
