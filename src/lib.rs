@@ -12,12 +12,14 @@ pub struct Grant {
     pub last_claim_time: u64,
     pub is_paused: bool,
     pub token: Address,
+    pub dispute_active: bool,  // frozen if true
 }
 
 #[contracttype]
 pub enum DataKey {
     Grant(u64),
     Count,
+    Arbiter,
 }
 
 #[contract]
@@ -37,6 +39,42 @@ impl GrantContract {
         env.storage().instance().extend_ttl(THRESHOLD, max_ttl);
     }
     // ────────────────────────────────────────────────
+
+    pub fn set_arbiter(env: Env, admin: Address, arbiter: Address) {
+        Self::ensure_sufficient_ttl(&env);
+
+        admin.require_auth();
+
+        // Only callable if arbiter not set yet (or add admin check)
+        if env.storage().instance().has(&DataKey::Arbiter) {
+            panic!("Arbiter already set");
+        }
+
+        env.storage().instance().set(&DataKey::Arbiter, &arbiter);
+    }
+
+    // ─── NEW: Core function for #17 ───
+    pub fn set_dispute_state(env: Env, grant_id: u64, active: bool) {
+        Self::ensure_sufficient_ttl(&env);
+
+        // Only the designated arbiter can call this
+        let arbiter: Address = env.storage().instance()
+            .get(&DataKey::Arbiter)
+            .unwrap_or_else(|| panic!("No arbiter set"));
+
+        arbiter.require_auth();
+
+        let mut grant: Grant = env.storage().instance()
+            .get(&DataKey::Grant(grant_id))
+            .unwrap_or_else(|| panic!("Grant not found"));
+
+        grant.dispute_active = active;
+
+        env.storage().instance().set(&DataKey::Grant(grant_id), &grant);
+
+        // Optional: emit event for frontend
+        // env.events().publish(("DisputeUpdated", grant_id), active);
+    }
 
     pub fn create_grant(
         env: Env,
@@ -68,6 +106,7 @@ impl GrantContract {
             last_claim_time: env.ledger().timestamp(),
             is_paused: false,
             token,
+            dispute_active: false,
         };
 
         env.storage()
@@ -92,6 +131,11 @@ impl GrantContract {
         if grant.is_paused {
             panic!("Grant PAUSED by admin");
         }
+
+        if grant.dispute_active {
+            panic!("Grant is under dispute - withdrawals blocked");
+        }
+
 
         let current_time = env.ledger().timestamp();
         let seconds_passed = current_time - grant.last_claim_time;
