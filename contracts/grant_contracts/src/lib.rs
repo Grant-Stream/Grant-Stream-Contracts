@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
-    Symbol, vec, IntoVal,
+    Symbol, vec, IntoVal, String, Bytes, Map,
 };
 
 // --- Constants ---
@@ -11,6 +11,7 @@ const XLM_DECIMALS: u32 = 7;
 const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS);
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
 const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60;
+const NFT_SUPPLY: i128 = 1000000; // Max NFT supply for completion certificates
 
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
@@ -66,6 +67,10 @@ enum DataKey {
     NativeToken,
     Grant(u64),
     RecipientGrants(Address),
+    NFTOwner(i128),
+    NFTTokenCount,
+    NFTApprovals(i128),
+    CompletionNFT(u64), // Maps grant_id to nft_token_id
 }
 
 #[contracterror]
@@ -85,6 +90,9 @@ pub enum Error {
     RescueWouldViolateAllocated = 11,
     GranteeMismatch = 12,
     GrantNotInactive = 13,
+    NFTAlreadyMinted = 14,
+    NFTMaxSupplyReached = 15,
+    NFTNotFound = 16,
 }
 
 // --- Internal Helpers ---
@@ -130,6 +138,147 @@ fn read_grant_ids(env: &Env) -> Vec<u64> {
         .unwrap_or_else(|| Vec::new(env))
 }
 
+// NFT Helper Functions
+fn read_nft_token_count(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKey::NFTTokenCount).unwrap_or(0)
+}
+
+fn write_nft_token_count(env: &Env, count: i128) {
+    env.storage().instance().set(&DataKey::NFTTokenCount, &count);
+}
+
+fn read_nft_owner(env: &Env, token_id: i128) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::NFTOwner(token_id)).ok_or(Error::NFTNotFound)
+}
+
+fn write_nft_owner(env: &Env, token_id: i128, owner: &Address) {
+    env.storage().instance().set(&DataKey::NFTOwner(token_id), owner);
+}
+
+fn read_completion_nft(env: &Env, grant_id: u64) -> Result<i128, Error> {
+    env.storage().instance().get(&DataKey::CompletionNFT(grant_id)).ok_or(Error::NFTNotFound)
+}
+
+fn write_completion_nft(env: &Env, grant_id: u64, token_id: i128) {
+    env.storage().instance().set(&DataKey::CompletionNFT(grant_id), &token_id);
+}
+
+fn generate_completion_metadata(
+    env: &Env,
+    grant_id: u64,
+    recipient: &Address,
+    total_amount: i128,
+    token_symbol: &str,
+    dao_name: &str,
+    repo_url: &str,
+) -> String {
+    let completion_date = env.ledger().timestamp();
+    let contract_address = env.current_contract_address();
+    
+    // Create JSON metadata following SEP-0039 standards
+    let metadata = format!(
+        r#"{{
+  "name": "Stellar Grant Completion Certificate",
+  "description": "Certificate of completion for Grant #{}. This NFT represents successful delivery of a funded project on the Stellar network.",
+  "image": "ipfs://QmCompletionCertificateImageHash",
+  "external_url": "https://grant-platform.xyz/grants/{}",
+  "attributes": [
+    {{
+      "trait_type": "Grant ID",
+      "value": "{}"
+    }},
+    {{
+      "trait_type": "Funding DAO",
+      "value": "{}"
+    }},
+    {{
+      "trait_type": "Total Amount",
+      "value": "{}"
+    }},
+    {{
+      "trait_type": "Token",
+      "value": "{}"
+    }},
+    {{
+      "trait_type": "Completion Date",
+      "value": "{}"
+    }},
+    {{
+      "trait_type": "Recipient",
+      "value": "{}"
+    }}
+  ],
+  "issuer": "{}",
+  "code": "GCC{}",
+  "project_repo": "{}",
+  "certificate_type": "grant_completion"
+}}"#,
+        grant_id,
+        grant_id,
+        grant_id,
+        dao_name,
+        total_amount,
+        token_symbol,
+        completion_date,
+        recipient,
+        contract_address,
+        grant_id,
+        repo_url
+    );
+    
+    String::from_str(env, &metadata)
+}
+
+fn mint_completion_certificate(
+    env: &Env,
+    grant_id: u64,
+    recipient: &Address,
+    total_amount: i128,
+    token_symbol: &str,
+    dao_name: &str,
+    repo_url: &str,
+) -> Result<i128, Error> {
+    // Check if NFT already minted for this grant
+    if env.storage().instance().has(&DataKey::CompletionNFT(grant_id)) {
+        return Err(Error::NFTAlreadyMinted);
+    }
+    
+    // Get current token count and check supply limit
+    let mut token_count = read_nft_token_count(env);
+    if token_count >= NFT_SUPPLY {
+        return Err(Error::NFTMaxSupplyReached);
+    }
+    
+    // Increment token count for new NFT
+    token_count = token_count.checked_add(1).ok_or(Error::MathOverflow)?;
+    write_nft_token_count(env, token_count);
+    
+    // Set NFT owner
+    write_nft_owner(env, token_count, recipient);
+    
+    // Map grant_id to nft_token_id
+    write_completion_nft(env, grant_id, token_count);
+    
+    // Generate metadata (in production, this would be uploaded to IPFS)
+    let _metadata = generate_completion_metadata(
+        env,
+        grant_id,
+        recipient,
+        total_amount,
+        token_symbol,
+        dao_name,
+        repo_url,
+    );
+    
+    // Publish mint event
+    env.events().publish(
+        (symbol_short!("completion_nft_minted"), grant_id),
+        (recipient, token_count, total_amount),
+    );
+    
+    Ok(token_count)
+}
+
 fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
     let mut total = 0_i128;
     let ids = read_grant_ids(env);
@@ -169,13 +318,15 @@ fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
     2500 + (7500 * progress) / 10000
 }
 
-fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
+fn settle_grant(env: &Env, grant: &mut Grant, grant_id: u64, now: u64) -> Result<(), Error> {
     if now < grant.last_update_ts { return Err(Error::InvalidState); }
     
     let elapsed = now - grant.last_update_ts;
     if elapsed == 0 {
         return Ok(());
     }
+
+    let was_completed = grant.status == GrantStatus::Completed;
 
     if grant.status == GrantStatus::Active {
         // Handle pending rate increases first
@@ -207,6 +358,19 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     if total_accounted >= grant.total_amount {
         grant.claimable = grant.total_amount - grant.withdrawn;
         grant.status = GrantStatus::Completed;
+        
+        // Mint completion certificate if this is the first time completing
+        if !was_completed {
+            let _token_id = mint_completion_certificate(
+                env,
+                grant_id,
+                &grant.recipient,
+                grant.total_amount,
+                "USDC", // Default token symbol - should be parameterized
+                "Stellar DAO", // Default DAO name - should be parameterized
+                "https://github.com/example/repo", // Default repo - should be parameterized
+            )?;
+        }
     }
 
     grant.last_update_ts = now;
@@ -314,7 +478,7 @@ impl GrantContract {
             return Err(Error::InvalidState);
         }
 
-        settle_grant(&mut grant, env.ledger().timestamp())?;
+        settle_grant(&env, &mut grant, grant_id, env.ledger().timestamp())?;
 
         if amount > grant.claimable {
             return Err(Error::InvalidAmount);
@@ -341,7 +505,7 @@ impl GrantContract {
         let mut grant = read_grant(&env, grant_id)?;
         if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
         
-        settle_grant(&mut grant, env.ledger().timestamp())?;
+        settle_grant(&env, &mut grant, grant_id, env.ledger().timestamp())?;
         grant.status = GrantStatus::Paused;
         write_grant(&env, grant_id, &grant);
         Ok(())
@@ -364,7 +528,7 @@ impl GrantContract {
         if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
         if new_rate < 0 { return Err(Error::InvalidRate); }
 
-        settle_grant(&mut grant, env.ledger().timestamp())?;
+        settle_grant(&env, &mut grant, grant_id, env.ledger().timestamp())?;
         
         let old_rate = grant.flow_rate;
         if new_rate > old_rate {
@@ -389,7 +553,7 @@ impl GrantContract {
         let mut grant = read_grant(&env, grant_id)?;
         if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
 
-        settle_grant(&mut grant, env.ledger().timestamp())?;
+        settle_grant(&env, &mut grant, grant_id, env.ledger().timestamp())?;
         
         let old_rate = grant.flow_rate;
         grant.flow_rate = grant.flow_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
@@ -406,7 +570,7 @@ impl GrantContract {
 
         if grant.status != GrantStatus::Paused { return Err(Error::InvalidState); }
 
-        settle_grant(&mut grant, env.ledger().timestamp())?;
+        settle_grant(&env, &mut grant, grant_id, env.ledger().timestamp())?;
         
         let claim_amount = grant.claimable;
         grant.claimable = 0;
@@ -455,11 +619,44 @@ impl GrantContract {
 
     pub fn claimable(env: Env, grant_id: u64) -> i128 {
         if let Ok(mut grant) = read_grant(&env, grant_id) {
-            let _ = settle_grant(&mut grant, env.ledger().timestamp());
+            let _ = settle_grant(&env, &mut grant, grant_id, env.ledger().timestamp());
             grant.claimable
         } else {
             0
         }
+    }
+
+    // NFT-related functions
+    pub fn nft_owner_of(env: Env, token_id: i128) -> Result<Address, Error> {
+        read_nft_owner(&env, token_id)
+    }
+
+    pub fn nft_token_count(env: Env) -> i128 {
+        read_nft_token_count(&env)
+    }
+
+    pub fn completion_nft_token_id(env: Env, grant_id: u64) -> Result<i128, Error> {
+        read_completion_nft(&env, grant_id)
+    }
+
+    pub fn nft_metadata(
+        env: Env,
+        grant_id: u64,
+        recipient: Address,
+        total_amount: i128,
+        token_symbol: String,
+        dao_name: String,
+        repo_url: String,
+    ) -> String {
+        generate_completion_metadata(
+            &env,
+            grant_id,
+            &recipient,
+            total_amount,
+            &token_symbol.to_string(),
+            &dao_name.to_string(),
+            &repo_url.to_string(),
+        )
     }
 }
 
@@ -474,3 +671,5 @@ fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_nft;

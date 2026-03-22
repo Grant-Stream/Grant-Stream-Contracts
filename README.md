@@ -39,7 +39,7 @@ stateDiagram-v2
     Cliff --> Streaming : start_stream()
     Streaming --> Paused/Slashed : pause_or_slash()
     Paused/Slashed --> Streaming : resume_stream()
-    Streaming --> Completed : finish_stream()
+    Streaming --> Completed + NFT : finish_stream()
     Streaming --> Cancelled : cancel_during_stream()
 
     note right of Proposed : Admin can create\nAdmin can cancel
@@ -47,7 +47,7 @@ stateDiagram-v2
     note right of Cliff : System moves to streaming
     note right of Streaming : Admin / Oracle actions
     note right of Paused/Slashed : Admin/Oracle
-    note right of Completed : Grants done
+    note right of Completed + NFT : Grants done + NFT minted
     note right of Cancelled : Grant terminated
 
 
@@ -78,6 +78,28 @@ stateDiagram-v2
 - **Milestone-based releases**: Funds released when milestones are approved
 - **Pause/Resume functionality**: Grants can be paused for extended periods
 - **Long duration support**: Tested with pause durations up to 100 years
+
+### Completion Certificate NFTs
+- **Automated minting**: When a grant reaches 100% completion, a "Stellar-Native Completion Certificate" NFT is automatically minted
+- **On-Chain Resume**: Each NFT serves as permanent proof of project delivery and technical skills
+- **SEP-0039 compliant**: Follows Stellar NFT standards for maximum interoperability
+- **Rich metadata**: Includes Grant ID, funding DAO, completion date, and project repository link
+- **Transferable**: Recipients can transfer or showcase their completion certificates
+
+#### NFT Metadata Structure
+Each completion certificate includes:
+- Grant ID and funding DAO information
+- Total amount and token type
+- Completion timestamp
+- Recipient address
+- Project repository URL
+- Certificate type identifier
+
+#### NFT Functions
+- `nft_owner_of(token_id)`: Get the owner of a completion certificate
+- `nft_token_count()`: Get total number of completion certificates minted
+- `completion_nft_token_id(grant_id)`: Get the NFT token ID for a completed grant
+- `nft_metadata(...)`: Generate metadata for a completion certificate
 
 ## Troubleshooting
 
