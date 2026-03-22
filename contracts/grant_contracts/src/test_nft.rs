@@ -78,9 +78,9 @@ mod tests {
         
         let grant_id: u64 = 42;
         let total_amount: i128 = 5000;
-        let token_symbol = String::from_str(&env, "USDC");
-        let dao_name = String::from_str(&env, "Stellar DAO");
-        let repo_url = String::from_str(&env, "https://github.com/example/project");
+        let token_symbol = "USDC";
+        let dao_name = "Stellar DAO";
+        let repo_url = "https://github.com/example/project";
 
         let contract_id = env.register(GrantContract, ());
         let client = GrantContractClient::new(&env, &contract_id);
@@ -89,9 +89,9 @@ mod tests {
             &grant_id,
             &recipient,
             &total_amount,
-            &token_symbol,
-            &dao_name,
-            &repo_url,
+            token_symbol,
+            dao_name,
+            repo_url,
         );
 
         // Verify metadata contains expected fields

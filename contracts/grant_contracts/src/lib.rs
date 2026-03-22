@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
-    Symbol, vec, IntoVal, String, Bytes, Map,
+    Symbol, vec, IntoVal, String, fmt,
 };
 
 // --- Constants ---
@@ -176,10 +176,11 @@ fn generate_completion_metadata(
     let contract_address = env.current_contract_address();
     
     // Create JSON metadata following SEP-0039 standards
-    let metadata = format!(
+    let metadata = fmt!(
+        &env,
         r#"{{
   "name": "Stellar Grant Completion Certificate",
-  "description": "Certificate of completion for Grant #{}. This NFT represents successful delivery of a funded project on the Stellar network.",
+  "description": "Certificate of completion for Grant #{}. This NFT represents successful delivery of a funded project on Stellar network.",
   "image": "ipfs://QmCompletionCertificateImageHash",
   "external_url": "https://grant-platform.xyz/grants/{}",
   "attributes": [
@@ -226,7 +227,7 @@ fn generate_completion_metadata(
         repo_url
     );
     
-    String::from_str(env, &metadata)
+    metadata
 }
 
 fn mint_completion_certificate(
@@ -272,7 +273,7 @@ fn mint_completion_certificate(
     
     // Publish mint event
     env.events().publish(
-        (symbol_short!("completion_nft_minted"), grant_id),
+        (Symbol::new(&env, "completion_nft_minted"), grant_id),
         (recipient, token_count, total_amount),
     );
     
@@ -644,18 +645,18 @@ impl GrantContract {
         grant_id: u64,
         recipient: Address,
         total_amount: i128,
-        token_symbol: String,
-        dao_name: String,
-        repo_url: String,
+        token_symbol: &str,
+        dao_name: &str,
+        repo_url: &str,
     ) -> String {
         generate_completion_metadata(
             &env,
             grant_id,
             &recipient,
             total_amount,
-            &token_symbol.to_string(),
-            &dao_name.to_string(),
-            &repo_url.to_string(),
+            token_symbol,
+            dao_name,
+            repo_url,
         )
     }
 }
