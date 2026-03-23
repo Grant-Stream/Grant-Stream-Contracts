@@ -59,6 +59,9 @@ pub struct Grant {
     pub validator_withdrawn: i128,
     /// Claimable balance accumulator for the validator (5% of stream).
     pub validator_claimable: i128,
+    /// Indicates if the grant is currently flagged by an auditor.
+    /// When true, withdrawals are blocked (Escrowed).
+    pub is_flagged: bool,
 }
 
 #[derive(Clone)]
@@ -72,6 +75,7 @@ enum DataKey {
     NativeToken,
     Grant(u64),
     RecipientGrants(Address),
+    Auditors,
 }
 
 #[contracterror]
@@ -93,6 +97,8 @@ pub enum Error {
     GrantNotInactive = 13,
     NotValidator = 14,
     InvalidEndDate = 15,
+    NotAuditor = 16,
+    GrantFlagged = 17,
 }
 
 // --- Internal Helpers ---
@@ -337,6 +343,7 @@ impl GrantContract {
             validator,
             validator_withdrawn: 0,
             validator_claimable: 0,
+            is_flagged: false,
         };
 
         env.storage().instance().set(&key, &grant);
@@ -359,6 +366,10 @@ impl GrantContract {
 
         if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
             return Err(Error::InvalidState);
+        }
+
+        if grant.is_flagged {
+            return Err(Error::GrantFlagged);
         }
 
         settle_grant(&mut grant, env.ledger().timestamp())?;
@@ -588,6 +599,82 @@ impl GrantContract {
             (top_up_amount, new_end_date, grant.flow_rate)
         );
 
+        Ok(())
+    }
+
+    pub fn set_auditors(env: Env, auditors: Vec<Address>) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        if auditors.len() > 3 {
+             return Err(Error::InvalidAmount);
+        }
+
+        env.storage().instance().set(&DataKey::Auditors, &auditors);
+        Ok(())
+    }
+
+    pub fn flag_grant(env: Env, auditor: Address, grant_id: u64) -> Result<(), Error> {
+        let auditors: Vec<Address> = env.storage().instance().get(&DataKey::Auditors).ok_or(Error::NotInitialized)?;
+        
+        let mut found = false;
+        for a in auditors.iter() {
+            if a == auditor {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(Error::NotAuditor);
+        }
+        
+        auditor.require_auth();
+
+        let mut grant = read_grant(&env, grant_id)?;
+        if grant.is_flagged {
+            return Err(Error::InvalidState);
+        }
+
+        grant.is_flagged = true;
+        write_grant(&env, grant_id, &grant);
+
+        env.events().publish((symbol_short!("flagged"), grant_id), (auditor, env.ledger().timestamp()));
+        Ok(())
+    }
+
+    pub fn resolve_flag(env: Env, auditor: Address, grant_id: u64) -> Result<(), Error> {
+        let auditors: Vec<Address> = env.storage().instance().get(&DataKey::Auditors).ok_or(Error::NotInitialized)?;
+        
+        // Either an auditor or the admin can resolve a flag
+        let mut found = false;
+        for a in auditors.iter() {
+            if a == auditor {
+                found = true;
+                break;
+            }
+        }
+        
+        if let Ok(admin) = read_admin(&env) {
+            if admin == auditor {
+                found = true;
+            }
+        }
+
+        if !found {
+            return Err(Error::NotAuditor);
+        }
+        
+        auditor.require_auth();
+
+        let mut grant = read_grant(&env, grant_id)?;
+        if !grant.is_flagged {
+            return Err(Error::InvalidState);
+        }
+
+        grant.is_flagged = false;
+        write_grant(&env, grant_id, &grant);
+
+        env.events().publish((symbol_short!("unflagged"), grant_id), (auditor, env.ledger().timestamp()));
         Ok(())
     }
 

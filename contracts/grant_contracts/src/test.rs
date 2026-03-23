@@ -3,7 +3,7 @@
 use super::{GrantContract, GrantContractClient, GrantStatus, SCALING_FACTOR};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Env,
+    token, Address, Env, vec,
 };
 
 fn setup_test(env: &Env) -> (Address, Address, Address, Address, Address, GrantContractClient<'_>) {
@@ -472,4 +472,58 @@ fn test_request_extension() {
     let grant3 = client.get_grant(&grant_id);
     assert_eq!(grant3.status, GrantStatus::Active);
     assert_eq!(grant3.flow_rate, 1 * SCALING_FACTOR);
+}
+
+#[test]
+fn test_auditor_role() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let auditor1 = Address::generate(&env);
+    let auditor2 = Address::generate(&env);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
+
+    set_timestamp(&env, 1000);
+    
+    // 1. Set Auditors
+    client.set_auditors(&vec![&env, auditor1.clone(), auditor2.clone()]);
+
+    // 2. Create Grant
+    let grant_id = 1;
+    let total_amount = 1000 * SCALING_FACTOR;
+    grant_token_admin.mint(&client.address, &total_amount);
+    client.create_grant(&grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0, &None);
+
+    set_timestamp(&env, 1100); // 100 tokens accrued
+    
+    // 3. Auditor Flags the Grant
+    client.flag_grant(&auditor1, &grant_id);
+    
+    let grant = client.get_grant(&grant_id);
+    assert!(grant.is_flagged);
+    
+    // 4. Withdrawal must fail during audit
+    // In soroban, regular Panics are difficult to catch across contract boundaries in tests without try_
+    // but try_withdraw should fail.
+    assert!(client.try_withdraw(&grant_id, &(10 * SCALING_FACTOR)).is_err());
+    
+    // 5. Auditor Resolves the Flag
+    client.resolve_flag(&auditor2, &grant_id);
+    assert!(!client.get_grant(&grant_id).is_flagged);
+    
+    // 6. Withdrawal now succeeds
+    client.withdraw(&grant_id, &(10 * SCALING_FACTOR));
+    
+    // 7. Flag again for admin resolve test
+    client.flag_grant(&auditor2, &grant_id);
+    assert!(client.get_grant(&grant_id).is_flagged);
+    
+    // 8. Admin resolves
+    client.resolve_flag(&admin, &grant_id);
+    assert!(!client.get_grant(&grant_id).is_flagged);
+
+    // 9. Unauthorized flagging must fail
+    let random_user = Address::generate(&env);
+    assert!(client.try_flag_grant(&random_user, &grant_id).is_err());
 }
