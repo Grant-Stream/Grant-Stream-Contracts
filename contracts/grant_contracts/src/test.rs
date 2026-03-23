@@ -527,3 +527,81 @@ fn test_auditor_role() {
     let random_user = Address::generate(&env);
     assert!(client.try_flag_grant(&random_user, &grant_id).is_err());
 }
+
+#[test]
+fn test_qf_drip_pool() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient1 = Address::generate(&env);
+    let recipient2 = Address::generate(&env);
+    let donor1 = Address::generate(&env);
+    let donor2 = Address::generate(&env);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
+
+    set_timestamp(&env, 1000);
+    
+    // 1. Setup QF Pool
+    let pool_id = 1;
+    let drip_rate = 10 * SCALING_FACTOR; // 10 tokens per second total matching
+    client.create_qf_pool(&pool_id, &grant_token_addr, &drip_rate);
+
+    // 2. Setup Grants
+    let grant_id1 = 1;
+    let grant_id2 = 2;
+    grant_token_admin.mint(&client.address, &(2000 * SCALING_FACTOR));
+    client.create_grant(&grant_id1, &recipient1, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0, &None);
+    client.create_grant(&grant_id2, &recipient2, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0, &None);
+
+    client.register_qf_project(&pool_id, &grant_id1);
+    client.register_qf_project(&pool_id, &grant_id2);
+
+    // 3. Donations to Project 1 (Two donors to trigger matching)
+    grant_token_admin.mint(&donor1, &(500 * SCALING_FACTOR));
+    grant_token_admin.mint(&donor2, &(500 * SCALING_FACTOR));
+    
+    // Project 1: Donor 1 gives 100. sum_sqrt = sqrt(100) = 10. weight = 10^2 - 100 = 0.
+    client.donate_to_qf(&donor1, &pool_id, &grant_id1, &(100 * SCALING_FACTOR));
+    // Project 1: Donor 2 gives 100. sum_sqrt = 10 + 10 = 20. weight = 20^2 - 200 = 200.
+    client.donate_to_qf(&donor2, &pool_id, &grant_id1, &(100 * SCALING_FACTOR));
+
+    let project1 = client.get_qf_project_info(&pool_id, &grant_id1);
+    assert!((project1.matching_weight - 200 * SCALING_FACTOR).abs() < 1000);
+
+    // 4. Wait 10 seconds.
+    // Total Weight = 200. Total Drip = 10 tokens/sec.
+    // Project 1 has 100% of weight, so it should get 10 * 10 = 100 tokens.
+    set_timestamp(&env, 1010);
+    
+    let info1 = client.get_qf_project_info(&pool_id, &grant_id1);
+    assert!((info1.accrued_matching - 100 * SCALING_FACTOR).abs() < 1000);
+
+    // 5. Donate to Project 2
+    // Project 2: Donor 1 gives 100. Donor 2 gives 100 -> weight = 200.
+    grant_token_admin.mint(&donor1, &(100 * SCALING_FACTOR));
+    grant_token_admin.mint(&donor2, &(100 * SCALING_FACTOR));
+    client.donate_to_qf(&donor1, &pool_id, &grant_id2, &(100 * SCALING_FACTOR));
+    client.donate_to_qf(&donor2, &pool_id, &grant_id1, &(100 * SCALING_FACTOR)); // Project 1 weight: sum_sqrt = 30. weight = 900 - 300 = 600.
+    client.donate_to_qf(&donor2, &pool_id, &grant_id2, &(100 * SCALING_FACTOR)); // Project 2 weight: sum_sqrt = 20. weight = 200.
+
+    // New Total Weight = 600 + 200 = 800.
+    // Projects share: P1 (6/8), P2 (2/8).
+    
+    set_timestamp(&env, 1020); // 10 more seconds
+    
+    let p1 = client.get_qf_project_info(&pool_id, &grant_id1);
+    let p2 = client.get_qf_project_info(&pool_id, &grant_id2);
+
+    // P1 got 100 before. 
+    // In the last 10s: Total drip = 100. P1 share = 100 * 6/8 = 75. Total P1 = 175.
+    // P2 share = 100 * 2/8 = 25.
+    assert!((p1.accrued_matching - 175 * SCALING_FACTOR).abs() < 1000);
+    assert!((p2.accrued_matching - 25 * SCALING_FACTOR).abs() < 1000);
+
+    // 6. Withdrawal
+    grant_token_admin.mint(&client.address, &(1000 * SCALING_FACTOR)); // Ensure contract has tokens for matching
+    client.withdraw_qf_match(&pool_id, &grant_id1);
+    
+    let final_info1 = client.get_qf_project_info(&pool_id, &grant_id1);
+    assert_eq!(final_info1.accrued_matching, 0);
+}

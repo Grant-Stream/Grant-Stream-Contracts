@@ -62,6 +62,28 @@ pub struct Grant {
     /// Indicates if the grant is currently flagged by an auditor.
     /// When true, withdrawals are blocked (Escrowed).
     pub is_flagged: bool,
+    /// QF Pool reference for matching funds
+    pub qf_pool_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct QFProject {
+    pub sum_sqrt: i128,          // Sum of sqrt of each donation
+    pub total_donated: i128,      // Total donations in raw units
+    pub matching_weight: i128,    // (sum_sqrt)^2 - total_donations
+    pub last_index: i128,         // Last global_index at update
+    pub accrued_matching: i128,   // Total matching tokens accrued but not withdrawn
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct QFPool {
+    pub token: Address,
+    pub drip_rate: i128,          // Matching funds distributed per second
+    pub total_weight: i128,       // Sum of all projects' matching_weight
+    pub global_index: i128,       // Scaled accumulator for drip rate
+    pub last_update_ts: u64,
 }
 
 #[derive(Clone)]
@@ -76,6 +98,8 @@ enum DataKey {
     Grant(u64),
     RecipientGrants(Address),
     Auditors,
+    QFPool(u64),
+    QFProject(u64, u64), // (pool_id, grant_id)
 }
 
 #[contracterror]
@@ -344,6 +368,7 @@ impl GrantContract {
             validator_withdrawn: 0,
             validator_claimable: 0,
             is_flagged: false,
+            qf_pool_id: None,
         };
 
         env.storage().instance().set(&key, &grant);
@@ -703,6 +728,205 @@ impl GrantContract {
         read_grant(&env, grant_id)
     }
 
+    /// Optimized Square Root for QF calculations (Soroban gas efficient)
+    pub fn sqrt(n: i128) -> i128 {
+        if n < 0 { return 0; }
+        if n <= 1 { return n; }
+        
+        let mut low = 1_i128;
+        let mut high = n;
+        let mut result = 1_i128;
+        
+        while low <= high {
+            let mid = (low + high) / 2;
+            if mid == 0 { low = 1; continue; }
+            if mid <= n / mid {
+                result = mid;
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+        result
+    }
+
+    pub fn create_qf_pool(
+        env: Env,
+        pool_id: u64,
+        token: Address,
+        drip_rate: i128,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let key = DataKey::QFPool(pool_id);
+        if env.storage().instance().has(&key) {
+            return Err(Error::GrantAlreadyExists);
+        }
+
+        let pool = QFPool {
+            token,
+            drip_rate,
+            total_weight: 0,
+            global_index: 0,
+            last_update_ts: env.ledger().timestamp(),
+        };
+        env.storage().instance().set(&key, &pool);
+        Ok(())
+    }
+
+    pub fn register_qf_project(
+        env: Env,
+        pool_id: u64,
+        grant_id: u64,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let pool: QFPool = env.storage().instance().get(&DataKey::QFPool(pool_id)).ok_or(Error::NotInitialized)?;
+        
+        let mut grant = read_grant(&env, grant_id)?;
+        if grant.qf_pool_id.is_some() {
+            return Err(Error::InvalidState); // Already in a pool
+        }
+        grant.qf_pool_id = Some(pool_id);
+        write_grant(&env, grant_id, &grant);
+
+        let grant_key = DataKey::QFProject(pool_id, grant_id);
+        if env.storage().instance().has(&grant_key) {
+             return Err(Error::GrantAlreadyExists);
+        }
+
+        let project = QFProject {
+            sum_sqrt: 0,
+            total_donated: 0,
+            matching_weight: 0,
+            last_index: pool.global_index,
+            accrued_matching: 0,
+        };
+        env.storage().instance().set(&grant_key, &project);
+        Ok(())
+    }
+
+    pub fn donate_to_qf(
+        env: Env,
+        donor: Address,
+        pool_id: u64,
+        grant_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        donor.require_auth();
+        if amount <= 0 { return Err(Error::InvalidAmount); }
+
+        let mut pool: QFPool = env.storage().instance().get(&DataKey::QFPool(pool_id)).ok_or(Error::NotInitialized)?;
+        let mut project: QFProject = env.storage().instance().get(&DataKey::QFProject(pool_id, grant_id)).ok_or(Error::GrantNotFound)?;
+        
+        // 1. Update Global Index
+        let now = env.ledger().timestamp();
+        if now > pool.last_update_ts && pool.total_weight > 0 {
+            let elapsed = (now - pool.last_update_ts) as i128;
+            let precision: i128 = 1_000_000_000_000; // 1e12 scaling
+            let delta_index = (elapsed * pool.drip_rate * precision) / pool.total_weight;
+            pool.global_index += delta_index;
+        }
+        pool.last_update_ts = now;
+
+        // 2. Settle Project Accrual
+        let precision: i128 = 1_000_000_000_000;
+        let delta_i = pool.global_index - project.last_index;
+        if delta_i > 0 {
+            let accrued = (project.matching_weight * delta_i) / precision;
+            project.accrued_matching += accrued;
+        }
+        project.last_index = pool.global_index;
+
+        // 3. Process Donation
+        let token_client = token::Client::new(&env, &pool.token);
+        let grant = read_grant(&env, grant_id)?;
+        token_client.transfer(&donor, &grant.recipient, &amount);
+
+        // 4. Recalculate Weights
+        pool.total_weight -= project.matching_weight;
+        
+        project.total_donated += amount;
+        // Use increased precision for sqrt: sqrt(amount * 1e8)
+        let scaled_amount = amount.checked_mul(100_000_000).ok_or(Error::MathOverflow)?;
+        project.sum_sqrt += Self::sqrt(scaled_amount);
+        
+        // (sum_sqrt ^ 2) / 1e8 - total_donated
+        let quadratic_total = (project.sum_sqrt * project.sum_sqrt) / 100_000_000;
+        project.matching_weight = (quadratic_total - project.total_donated).max(0);
+        
+        pool.total_weight += project.matching_weight;
+
+        // 5. Store State
+        env.storage().instance().set(&DataKey::QFPool(pool_id), &pool);
+        env.storage().instance().set(&DataKey::QFProject(pool_id, grant_id), &project);
+
+        env.events().publish((symbol_short!("qfdonate"), pool_id, grant_id), (donor, amount, project.matching_weight));
+        Ok(())
+    }
+
+    pub fn withdraw_qf_match(
+        env: Env,
+        pool_id: u64,
+        grant_id: u64,
+    ) -> Result<(), Error> {
+        let mut pool: QFPool = env.storage().instance().get(&DataKey::QFPool(pool_id)).ok_or(Error::NotInitialized)?;
+        let mut project: QFProject = env.storage().instance().get(&DataKey::QFProject(pool_id, grant_id)).ok_or(Error::GrantNotFound)?;
+        
+        let now = env.ledger().timestamp();
+        if now > pool.last_update_ts && pool.total_weight > 0 {
+            let elapsed = (now - pool.last_update_ts) as i128;
+            let precision: i128 = 1_000_000_000_000;
+            pool.global_index += (elapsed * pool.drip_rate * precision) / pool.total_weight;
+            pool.last_update_ts = now;
+            env.storage().instance().set(&DataKey::QFPool(pool_id), &pool);
+        }
+
+        let precision: i128 = 1_000_000_000_000;
+        let delta_i = pool.global_index - project.last_index;
+        if delta_i > 0 {
+            project.accrued_matching += (project.matching_weight * delta_i) / precision;
+        }
+        project.last_index = pool.global_index;
+
+        let amount = project.accrued_matching;
+        if amount <= 0 {
+             return Err(Error::InvalidAmount);
+        }
+
+        let grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+
+        project.accrued_matching = 0;
+        env.storage().instance().set(&DataKey::QFProject(pool_id, grant_id), &project);
+
+        let token_client = token::Client::new(&env, &pool.token);
+        token_client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
+
+        env.events().publish((symbol_short!("qfwd"), pool_id, grant_id), (grant.recipient, amount));
+        Ok(())
+    }
+
+    pub fn get_qf_project_info(env: Env, pool_id: u64, grant_id: u64) -> Result<QFProject, Error> {
+        let pool: QFPool = env.storage().instance().get(&DataKey::QFPool(pool_id)).ok_or(Error::NotInitialized)?;
+        let mut project: QFProject = env.storage().instance().get(&DataKey::QFProject(pool_id, grant_id)).ok_or(Error::GrantNotFound)?;
+        
+        let now = env.ledger().timestamp();
+        let mut global_index = pool.global_index;
+        if now > pool.last_update_ts && pool.total_weight > 0 {
+            let elapsed = (now - pool.last_update_ts) as i128;
+            let precision: i128 = 1_000_000_000_000;
+            global_index += (elapsed * pool.drip_rate * precision) / pool.total_weight;
+        }
+
+        let precision: i128 = 1_000_000_000_000;
+        let delta_i = global_index - project.last_index;
+        if delta_i > 0 {
+            project.accrued_matching += (project.matching_weight * delta_i) / precision;
+        }
+        project.last_index = global_index;
+        
+        Ok(project)
+    }
+
     pub fn claimable(env: Env, grant_id: u64) -> i128 {
         if let Ok(mut grant) = read_grant(&env, grant_id) {
             let _ = settle_grant(&mut grant, env.ledger().timestamp());
@@ -794,8 +1018,8 @@ impl GrantContract {
         };
         
         // Integer square root approximation
-        let sqrt_progress_factor = Self::integer_sqrt(progress_factor);
-        let sqrt_factor = Self::integer_sqrt(factor_scaled);
+        let sqrt_progress_factor = Self::sqrt(progress_factor as i128) as u128;
+        let sqrt_factor = Self::sqrt(factor_scaled as i128) as u128;
         
         if sqrt_factor == 0 {
             return 0;
@@ -817,41 +1041,8 @@ impl GrantContract {
         
         vested.min(total)
     }
-    
-    /// Integer square root using binary search
-    fn integer_sqrt(n: u128) -> u128 {
-        if n <= 1 {
-            return n;
-        }
-        
-        let mut low = 1u128;
-        let mut high = n;
-        let mut result = 1u128;
-        
-        while low <= high {
-            let mid = (low + high) / 2;
-            let mid_squared = match mid.checked_mul(mid) {
-                Some(v) => v,
-                None => {
-                    high = mid - 1;
-                    continue;
-                }
-            };
-            
-            if mid_squared == n {
-                return mid;
-            }
-            
-            if mid_squared < n {
-                low = mid + 1;
-                result = mid;
-            } else {
-                high = mid - 1;
-            }
-        }
-        
-        result
-    }
+
+    // consolidated sqrt already implemented above
     /// Returns the current claimable balance for the validator (5% share).
     pub fn validator_claimable(env: Env, grant_id: u64) -> i128 {
         if let Ok(mut grant) = read_grant(&env, grant_id) {
