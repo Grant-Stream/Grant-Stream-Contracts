@@ -1,6 +1,4 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Symbol, Env, String, Vec, Map, xdr::ScVal};
-
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
     Symbol, vec, IntoVal,
@@ -8,10 +6,10 @@ use soroban_sdk::{
 
 // --- Constants ---
 pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
-const XLM_DECIMALS: u32 = 7;
-const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS);
+const _XLM_DECIMALS: u32 = 7;
+const _RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(_XLM_DECIMALS);
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
-const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60;
+const _INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60;
 
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
@@ -94,6 +92,7 @@ pub enum Error {
     GranteeMismatch = 12,
     GrantNotInactive = 13,
     NotValidator = 14,
+    InvalidEndDate = 15,
 }
 
 // --- Internal Helpers ---
@@ -521,6 +520,77 @@ impl GrantContract {
         Ok(())
     }
 
+    /// Allows the DAO to extend a grant's duration by adding funds and setting a new end date.
+    /// The flow_rate is recalculated to ensure a smooth transition from the current state
+    /// to the new end date.
+    pub fn request_extension(
+        env: Env,
+        grant_id: u64,
+        top_up_amount: i128,
+        new_end_date: u64,
+    ) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        let mut grant = read_grant(&env, grant_id)?;
+        let now = env.ledger().timestamp();
+        
+        if new_end_date <= now {
+            return Err(Error::InvalidEndDate);
+        }
+
+        if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
+            return Err(Error::InvalidState);
+        }
+
+        // 1. Settle at the old rate first
+        settle_grant(&mut grant, now)?;
+
+        // 2. Add top-up if any
+        if top_up_amount > 0 {
+            let token_addr = read_grant_token(&env)?;
+            let client = token::Client::new(&env, &token_addr);
+            // The admin must have authorized this transfer
+            client.transfer(&admin, &env.current_contract_address(), &top_up_amount);
+            grant.total_amount = grant.total_amount.checked_add(top_up_amount).ok_or(Error::MathOverflow)?;
+        }
+
+        // 3. Recalculate flow_rate for the new duration
+        let total_accounted = grant.withdrawn
+            .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
+            .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+            .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+
+        let remaining_to_accrue = grant.total_amount.checked_sub(total_accounted).ok_or(Error::MathOverflow)?;
+        let duration = (new_end_date - now) as i128;
+        
+        if remaining_to_accrue < 0 {
+             return Err(Error::InvalidAmount);
+        }
+
+        if duration > 0 {
+            grant.flow_rate = remaining_to_accrue.checked_div(duration).ok_or(Error::MathOverflow)?;
+        } else {
+            grant.flow_rate = 0;
+        }
+
+        grant.last_update_ts = now;
+        
+        // Reactivate if it was completed
+        if grant.status == GrantStatus::Completed {
+            grant.status = GrantStatus::Active;
+        }
+
+        write_grant(&env, grant_id, &grant);
+
+        env.events().publish(
+            (symbol_short!("extend"), grant_id),
+            (top_up_amount, new_end_date, grant.flow_rate)
+        );
+
+        Ok(())
+    }
+
     pub fn rescue_tokens(env: Env, token_address: Address, amount: i128, to: Address) -> Result<(), Error> {
         require_admin_auth(&env)?;
         if amount <= 0 { return Err(Error::InvalidAmount); }
@@ -637,8 +707,8 @@ impl GrantContract {
         };
         
         // Integer square root approximation
-        let sqrt_progress_factor = integer_sqrt(progress_factor);
-        let sqrt_factor = integer_sqrt(factor_scaled);
+        let sqrt_progress_factor = Self::integer_sqrt(progress_factor);
+        let sqrt_factor = Self::integer_sqrt(factor_scaled);
         
         if sqrt_factor == 0 {
             return 0;
@@ -694,6 +764,7 @@ impl GrantContract {
         }
         
         result
+    }
     /// Returns the current claimable balance for the validator (5% share).
     pub fn validator_claimable(env: Env, grant_id: u64) -> i128 {
         if let Ok(mut grant) = read_grant(&env, grant_id) {

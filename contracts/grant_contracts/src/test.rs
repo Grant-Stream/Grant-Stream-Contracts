@@ -6,7 +6,7 @@ use soroban_sdk::{
     token, Address, Env,
 };
 
-fn setup_test(env: &Env) -> (Address, Address, Address, Address, Address, GrantContractClient) {
+fn setup_test(env: &Env) -> (Address, Address, Address, Address, Address, GrantContractClient<'_>) {
     let admin = Address::generate(env);
     let grant_token_addr = env.register_stellar_asset_contract_v2(admin.clone());
     let native_token_addr = env.register_stellar_asset_contract_v2(admin.clone());
@@ -123,7 +123,7 @@ fn test_rage_quit() {
 fn test_apply_kpi_multiplier_requires_oracle_auth() {
     let env = Env::default();
     env.mock_all_auths();
-    let (_admin, _grant_token, _treasury, oracle, _native, client) = setup_test(&env);
+    let (_admin, _grant_token, _treasury, _oracle, _native, client) = setup_test(&env);
     let recipient = Address::generate(&env);
     
     let grant_id = 1;
@@ -402,5 +402,74 @@ fn test_withdraw_validator_requires_auth() {
     assert!(client.try_withdraw_validator(&grant_id, &(100 * SCALING_FACTOR)).is_err());
 
     // Exact amount must succeed
+    // Exact amount must succeed
     client.withdraw_validator(&grant_id, &(5 * SCALING_FACTOR));
+}
+
+#[test]
+fn test_request_extension() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient = Address::generate(&env);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
+
+    set_timestamp(&env, 1000);
+    let grant_id = 1;
+    let initial_amount = 100 * SCALING_FACTOR;
+    let initial_flow_rate = 1 * SCALING_FACTOR; // 100 seconds duration
+    
+    grant_token_admin.mint(&client.address, &initial_amount);
+    client.create_grant(&grant_id, &recipient, &initial_amount, &initial_flow_rate, &0, &None);
+
+    // 1. Advance 50 seconds: 50 tokens accrued
+    set_timestamp(&env, 1050);
+    assert_eq!(client.claimable(&grant_id), 50 * SCALING_FACTOR);
+
+    // 2. Extend the grant
+    // Current state: 50 accrued, 50 remaining to accrue.
+    // Top up: 100 tokens. Total remaining to accrue: 50 + 100 = 150.
+    // New end date: 1200. Remaining duration: 1200 - 1050 = 150 seconds.
+    // New flow rate should be: 150 / 150 = 1 token/sec.
+    
+    let top_up = 100 * SCALING_FACTOR;
+    let new_end_date = 1200;
+    
+    // Mint top-up to admin so they can deposit it
+    grant_token_admin.mint(&admin, &top_up);
+    
+    client.request_extension(&grant_id, &top_up, &new_end_date);
+    
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.total_amount, 200 * SCALING_FACTOR);
+    assert_eq!(grant.flow_rate, 1 * SCALING_FACTOR);
+    assert_eq!(grant.status, GrantStatus::Active);
+
+    // 3. Advance another 50 seconds (T=1100): 50 more tokens accrued
+    set_timestamp(&env, 1100);
+    assert_eq!(client.claimable(&grant_id), 100 * SCALING_FACTOR);
+
+    // 4. Extend again with a different rate
+    // Current state: 100 accrued, 100 remaining.
+    // Top up: 0. New end date: 1300. Remaining duration: 1300 - 1100 = 200 seconds.
+    // New flow rate: 100 / 200 = 0.5 tokens/sec.
+    client.request_extension(&grant_id, &0, &1300);
+    
+    let grant2 = client.get_grant(&grant_id);
+    assert_eq!(grant2.flow_rate, SCALING_FACTOR / 2);
+    
+    // 5. Test reactivation of completed grant
+    set_timestamp(&env, 1500); // Past 1300
+    client.withdraw(&grant_id, &0); // Trigger settlement and write to storage
+    assert_eq!(client.get_grant(&grant_id).status, GrantStatus::Completed);
+    
+    // Extend a completed grant
+    // Remaining to accrue: 0. Top up: 200. New end date: 1700. Duration: 1700 - 1500 = 200.
+    // Rate: 200 / 200 = 1.
+    grant_token_admin.mint(&admin, &(200 * SCALING_FACTOR));
+    client.request_extension(&grant_id, &(200 * SCALING_FACTOR), &1700);
+    
+    let grant3 = client.get_grant(&grant_id);
+    assert_eq!(grant3.status, GrantStatus::Active);
+    assert_eq!(grant3.flow_rate, 1 * SCALING_FACTOR);
 }
