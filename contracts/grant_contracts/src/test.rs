@@ -605,3 +605,44 @@ fn test_qf_drip_pool() {
     let final_info1 = client.get_qf_project_info(&pool_id, &grant_id1);
     assert_eq!(final_info1.accrued_matching, 0);
 }
+
+#[test]
+fn test_treasury_rage_quit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
+    let recipient1 = Address::generate(&env);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
+
+    set_timestamp(&env, 1000);
+    
+    // 1. Create a large grant
+    let grant_id = 1;
+    let initial_total = 1000 * SCALING_FACTOR;
+    grant_token_admin.mint(&client.address, &initial_total);
+    client.create_grant(&grant_id, &recipient1, &initial_total, &SCALING_FACTOR, &0, &None);
+
+    // 2. Simulate Rage-Quit by reducing treasury balance
+    // Current TotalAllocated = 1000. New Treasury = 500.
+    client.notify_treasury_reduction(&(500 * SCALING_FACTOR));
+    
+    // 3. Project should be pro-rated to 50%
+    let grant = client.get_grant(&grant_id);
+    // Note: get_grant usually reads from storage. 
+    // Does it apply scaling? Yes, we should probably add apply_scaling to get_grant too 
+    // OR realize that withdraw will apply it.
+    // Let's check withdraw.
+    
+    set_timestamp(&env, 1100); // 100 seconds
+    
+    // Original flow rate was 1 token/sec. New should be 0.5 tokens/sec.
+    // At T=1100 (100 sec since 1000), it should have accrued 50 tokens.
+    // total_amount should be 500.
+    
+    client.withdraw(&grant_id, &(10 * SCALING_FACTOR));
+    
+    let grant_after = client.get_grant(&grant_id);
+    assert_eq!(grant_after.total_amount, 500 * SCALING_FACTOR);
+    assert_eq!(grant_after.flow_rate, SCALING_FACTOR / 2);
+    assert_eq!(grant_after.claimable, 40 * SCALING_FACTOR); // 50 accrued - 10 withdrawn
+}

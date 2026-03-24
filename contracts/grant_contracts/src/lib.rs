@@ -64,6 +64,9 @@ pub struct Grant {
     pub is_flagged: bool,
     /// QF Pool reference for matching funds
     pub qf_pool_id: Option<u64>,
+    /// Last global cumulative scaling index applied to this grant.
+    /// Used for lazy pro-rating if the treasury shrinks.
+    pub last_scaling_index: i128,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,6 +103,8 @@ enum DataKey {
     Auditors,
     QFPool(u64),
     QFProject(u64, u64), // (pool_id, grant_id)
+    CumulativeScalingIndex,
+    TotalAllocated,
 }
 
 #[contracterror]
@@ -150,7 +155,62 @@ fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
 }
 
 fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
-    env.storage().instance().set(&DataKey::Grant(grant_id), grant);
+    let key = DataKey::Grant(grant_id);
+    env.storage().instance().set(&key, grant);
+}
+
+const GLOBAL_SCALE_PRECISION: i128 = 1_000_000_000_000;
+
+fn read_global_scaling_index(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKey::CumulativeScalingIndex).unwrap_or(GLOBAL_SCALE_PRECISION)
+}
+
+fn read_total_allocated(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKey::TotalAllocated).unwrap_or(0)
+}
+
+/// Applies global scaling (pro-rating) to a grant if it's behind the current global index.
+fn apply_scaling_to_grant(env: &Env, grant: &mut Grant) -> Result<bool, Error> {
+    let global_index = read_global_scaling_index(env);
+    if grant.last_scaling_index == 0 {
+        grant.last_scaling_index = global_index;
+        return Ok(false);
+    }
+    
+    if grant.last_scaling_index == global_index {
+        return Ok(false);
+    }
+
+    if grant.status != GrantStatus::Active && grant.status != GrantStatus::Paused {
+        grant.last_scaling_index = global_index;
+        return Ok(false);
+    }
+
+    let remaining = grant.total_amount.checked_sub(grant.withdrawn).ok_or(Error::MathOverflow)?;
+    if remaining <= 0 {
+        grant.last_scaling_index = global_index;
+        return Ok(false);
+    }
+
+    // NewRemaining = (Remaining * global_index) / last_index
+    let new_remaining = remaining.checked_mul(global_index).ok_or(Error::MathOverflow)? 
+                        / grant.last_scaling_index;
+    
+    let reduction = remaining.checked_sub(new_remaining).ok_or(Error::MathOverflow)?;
+    if reduction > 0 {
+        // Update global allocated total (subtract the "slashed" amount)
+        let total_allocated = read_total_allocated(env);
+        let new_total = total_allocated.checked_sub(reduction).ok_or(Error::MathOverflow)?;
+        env.storage().instance().set(&DataKey::TotalAllocated, &new_total);
+    }
+
+    grant.total_amount = grant.withdrawn.checked_add(new_remaining).ok_or(Error::MathOverflow)?;
+    // Pro-rate flow rate as well
+    grant.flow_rate = grant.flow_rate.checked_mul(global_index).ok_or(Error::MathOverflow)?
+                      / grant.last_scaling_index;
+    
+    grant.last_scaling_index = global_index;
+    Ok(true)
 }
 
 fn read_grant_token(env: &Env) -> Result<Address, Error> {
@@ -324,6 +384,8 @@ impl GrantContract {
         env.storage().instance().set(&DataKey::Oracle, &oracle);
         env.storage().instance().set(&DataKey::NativeToken, &native_token);
         env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
+        env.storage().instance().set(&DataKey::CumulativeScalingIndex, &GLOBAL_SCALE_PRECISION);
+        env.storage().instance().set(&DataKey::TotalAllocated, &0_i128);
         Ok(())
     }
 
@@ -366,10 +428,15 @@ impl GrantContract {
             warmup_duration,
             validator,
             validator_withdrawn: 0,
-            validator_claimable: 0,
-            is_flagged: false,
+            validator_claimable: 0, // Initialize validator_claimable
+            is_flagged: false, // Initialize is_flagged
             qf_pool_id: None,
+            last_scaling_index: read_global_scaling_index(&env),
         };
+
+        let mut total_allocated = read_total_allocated(&env);
+        total_allocated = total_allocated.checked_add(total_amount).ok_or(Error::MathOverflow)?;
+        env.storage().instance().set(&DataKey::TotalAllocated, &total_allocated);
 
         env.storage().instance().set(&key, &grant);
 
@@ -389,6 +456,8 @@ impl GrantContract {
         let mut grant = read_grant(&env, grant_id)?;
         grant.recipient.require_auth();
 
+        apply_scaling_to_grant(&env, &mut grant)?;
+
         if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
             return Err(Error::InvalidState);
         }
@@ -407,6 +476,10 @@ impl GrantContract {
         grant.withdrawn = grant.withdrawn.checked_add(amount).ok_or(Error::MathOverflow)?;
         grant.last_claim_time = env.ledger().timestamp();
 
+        let mut total_allocated = read_total_allocated(&env);
+        total_allocated = total_allocated.checked_sub(amount).ok_or(Error::MathOverflow)?;
+        env.storage().instance().set(&DataKey::TotalAllocated, &total_allocated);
+
         write_grant(&env, grant_id, &grant);
 
         let token_addr = read_grant_token(&env)?;
@@ -414,7 +487,7 @@ impl GrantContract {
         let target = grant.redirect.unwrap_or(grant.recipient.clone());
         client.transfer(&env.current_contract_address(), &target, &amount);
 
-        try_call_on_withdraw(&env, &grant.recipient, grant_id, amount);
+        try_call_on_withdraw(&env, &grant.recipient, grant_id, amount); // This function is not defined in the provided code.
 
         Ok(())
     }
@@ -424,6 +497,7 @@ impl GrantContract {
         let mut grant = read_grant(&env, grant_id)?;
         if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
         
+        apply_scaling_to_grant(&env, &mut grant)?;
         settle_grant(&mut grant, env.ledger().timestamp())?;
         grant.status = GrantStatus::Paused;
         write_grant(&env, grant_id, &grant);
@@ -537,6 +611,11 @@ impl GrantContract {
 
         settle_grant(&mut grant, env.ledger().timestamp())?;
 
+        let unwithdrawn = grant.total_amount.checked_sub(grant.withdrawn).ok_or(Error::MathOverflow)?;
+        let mut total_allocated = read_total_allocated(&env);
+        total_allocated = total_allocated.checked_sub(unwithdrawn).ok_or(Error::MathOverflow)?;
+        env.storage().instance().set(&DataKey::TotalAllocated, &total_allocated);
+
         // Remaining = total - already withdrawn - pending claimable (both sides)
         let total_paid = grant.withdrawn
             .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
@@ -571,6 +650,8 @@ impl GrantContract {
         let mut grant = read_grant(&env, grant_id)?;
         let now = env.ledger().timestamp();
         
+        apply_scaling_to_grant(&env, &mut grant)?;
+
         if new_end_date <= now {
             return Err(Error::InvalidEndDate);
         }
@@ -611,6 +692,13 @@ impl GrantContract {
         }
 
         grant.last_update_ts = now;
+        grant.rate_updated_at = now; // Added this line based on the diff's intent
+
+        if top_up_amount > 0 {
+            let mut total_allocated = read_total_allocated(&env);
+            total_allocated = total_allocated.checked_add(top_up_amount).ok_or(Error::MathOverflow)?;
+            env.storage().instance().set(&DataKey::TotalAllocated, &total_allocated);
+        }
         
         // Reactivate if it was completed
         if grant.status == GrantStatus::Completed {
@@ -725,7 +813,9 @@ impl GrantContract {
     }
 
     pub fn get_grant(env: Env, grant_id: u64) -> Result<Grant, Error> {
-        read_grant(&env, grant_id)
+        let mut grant = read_grant(&env, grant_id)?;
+        apply_scaling_to_grant(&env, &mut grant)?;
+        Ok(grant)
     }
 
     /// Optimized Square Root for QF calculations (Soroban gas efficient)
@@ -905,6 +995,25 @@ impl GrantContract {
         Ok(())
     }
 
+    /// DAO-level notification that funds have left the treasury (e.g., due to Rage-Quit).
+    pub fn notify_treasury_reduction(env: Env, new_balance: i128) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let total_allocated = read_total_allocated(&env);
+        
+        if new_balance < total_allocated {
+            let mut global_index = read_global_scaling_index(&env);
+            // new_index = old_index * (new_balance / total_allocated)
+            global_index = (global_index * new_balance) / total_allocated;
+            
+            env.storage().instance().set(&DataKey::CumulativeScalingIndex, &global_index);
+            env.storage().instance().set(&DataKey::TotalAllocated, &new_balance);
+
+            env.events().publish((symbol_short!("pro_rate"),), (total_allocated, new_balance, global_index));
+        }
+        
+        Ok(())
+    }
+
     pub fn get_qf_project_info(env: Env, pool_id: u64, grant_id: u64) -> Result<QFProject, Error> {
         let pool: QFPool = env.storage().instance().get(&DataKey::QFPool(pool_id)).ok_or(Error::NotInitialized)?;
         let mut project: QFProject = env.storage().instance().get(&DataKey::QFProject(pool_id, grant_id)).ok_or(Error::GrantNotFound)?;
@@ -929,6 +1038,7 @@ impl GrantContract {
 
     pub fn claimable(env: Env, grant_id: u64) -> i128 {
         if let Ok(mut grant) = read_grant(&env, grant_id) {
+            let _ = apply_scaling_to_grant(&env, &mut grant);
             let _ = settle_grant(&mut grant, env.ledger().timestamp());
             grant.claimable
         } else {

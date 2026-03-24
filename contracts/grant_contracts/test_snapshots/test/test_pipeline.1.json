@@ -433,6 +433,21 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "CumulativeScalingIndex"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "i128": {
+                            "hi": 0,
+                            "lo": 1000000000000
+                          }
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "Grant"
                             },
                             {
@@ -490,6 +505,17 @@
                             },
                             {
                               "key": {
+                                "symbol": "last_scaling_index"
+                              },
+                              "val": {
+                                "i128": {
+                                  "hi": 0,
+                                  "lo": 1000000000000
+                                }
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "last_update_ts"
                               },
                               "val": {
@@ -506,6 +532,12 @@
                                   "lo": 20000000
                                 }
                               }
+                            },
+                            {
+                              "key": {
+                                "symbol": "qf_pool_id"
+                              },
+                              "val": "void"
                             },
                             {
                               "key": {
@@ -691,6 +723,21 @@
                               "u64": 1
                             }
                           ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "TotalAllocated"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "i128": {
+                            "hi": 0,
+                            "lo": 9999950000000
+                          }
                         }
                       },
                       {
