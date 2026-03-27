@@ -575,6 +575,25 @@ pub enum ChallengeStatus {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct ReputationScore {
+    pub user: Address,
+    pub total_completions: u32,     // Total educational completions across projects
+    pub average_score: u32,         // Average completion score (0-100)
+    pub last_updated: u64,          // Last time reputation was calculated
+    pub projects_completed: Vec<Address>, // List of project contracts completed
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct ExternalContractQuery {
+    pub contract_address: Address,
+    pub query_function: Symbol,     // Function to call (e.g., "get_completion_status")
+    pub project_name: String,       // Human-readable project name
+    pub weight: u32,               // Weight for reputation calculation (1-100)
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub enum GrantError {
     GrantNotFound,
     Unauthorized,
@@ -707,6 +726,11 @@ enum DataKey {
     GrantBalanceCache(u64), // Maps grant_id to cached balance snapshot
     LastCacheUpdate(u64), // Maps grant_id to last cache update timestamp
     BulkBalanceQuery, // Cached bulk balance data for high-throughput scenarios
+    // Cross-Project Reputation Scoring keys
+    ReputationScore(Address), // Maps user address to reputation score
+    ExternalContracts, // List of external contract addresses for reputation queries
+    ReputationCache(Address, Address), // Maps (user, contract) to cached completion status
+    ReputationCacheExpiry(Address, Address), // Maps (user, contract) to cache expiry timestamp
 }
 
 #[contracterror]
@@ -786,6 +810,8 @@ pub enum Error {
     // Pause cooldown errors
     PauseCooldownActive = 63,
     InsufficientSuperMajority = 64,
+    // Cross-project reputation errors
+    ContractError = 65,
 }
 
 // --- Internal Helpers ---
@@ -3633,8 +3659,11 @@ pub mod grant {
             return Err(Error::StakeAlreadyDeposited);
         }
 
-        // Validate stake amount
-        if amount != PROPOSAL_STAKE_AMOUNT {
+        // Calculate reputation-based discount
+        let required_amount = calculate_reputation_stake_discount(&env, &staker, PROPOSAL_STAKE_AMOUNT)?;
+
+        // Validate stake amount (must be at least the discounted amount)
+        if amount < required_amount {
             return Err(Error::InvalidStakeAmount);
         }
 
@@ -3665,10 +3694,10 @@ pub mod grant {
         let current_balance = read_stake_escrow_balance(&env);
         write_stake_escrow_balance(&env, current_balance + amount);
 
-        // Publish stake deposit event
+        // Publish stake deposit event with reputation discount info
         env.events().publish(
             (Symbol::new(&env, "proposal_stake_deposited"), grant_id),
-            (staker, amount, now),
+            (staker, amount, required_amount, now),
         );
 
         Ok(())
@@ -4571,6 +4600,28 @@ pub mod grant {
         Ok(stats)
     }
 
+    // ===== CROSS-PROJECT REPUTATION SCORING FUNCTIONS =====
+
+    /// Register an external contract for reputation queries (admin only)
+    pub fn register_external_contract(
+        env: Env,
+        admin: Address,
+        contract_config: ExternalContractQuery,
+    ) -> Result<(), Error> {
+        register_external_contract(&env, admin, contract_config)
+    }
+
+    /// Get reputation score for a user
+    pub fn get_reputation_score(env: Env, user: Address) -> Result<ReputationScore, Error> {
+        get_reputation_score(env, user)
+    }
+
+    /// Calculate reputation-based stake discount for preview
+    pub fn preview_stake_discount(env: Env, user: Address) -> Result<i128, Error> {
+        calculate_reputation_stake_discount(&env, &user, PROPOSAL_STAKE_AMOUNT)
+    }
+}
+
     /// Helper function to invalidate balance cache when balances change
     fn invalidate_balance_cache(env: &Env, grant_id: u64) {
         env.storage().instance().remove(&DataKey::GrantBalanceCache(grant_id));
@@ -4587,6 +4638,185 @@ fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i
     );
 }
 
+// ===== CROSS-PROJECT REPUTATION SCORING FUNCTIONS =====
+
+/// Register an external contract for reputation queries
+pub fn register_external_contract(env: &Env, admin: Address, contract_config: ExternalContractQuery) -> Result<(), Error> {
+    require_admin_auth(env)?;
+
+    let mut contracts = read_external_contracts(env);
+    contracts.push_back(contract_config);
+    write_external_contracts(env, contracts);
+
+    env.events().publish(
+        (Symbol::new(env, "external_contract_registered"), contract_config.contract_address.clone()),
+        (admin, contract_config.project_name),
+    );
+
+    Ok(())
+}
+
+/// Query external contract for user's completion status
+fn query_external_completion(env: &Env, user: &Address, contract: &Address, function: &Symbol) -> Result<bool, Error> {
+    // Check cache first
+    if let Some(cached_result) = read_reputation_cache(env, user, contract) {
+        let now = env.ledger().timestamp();
+        let expiry = read_reputation_cache_expiry(env, user, contract)
+            .unwrap_or(now + 3600); // Default 1 hour expiry
+
+        if now < expiry {
+            return Ok(cached_result);
+        }
+    }
+
+    // Query external contract
+    let args = (user.clone(),).into_val(env);
+    match env.try_invoke_contract::<bool, soroban_sdk::Error>(contract, function, args) {
+        Ok(Ok(completed)) => {
+            // Cache the result for 1 hour
+            let expiry = env.ledger().timestamp() + 3600;
+            write_reputation_cache(env, user, contract, completed);
+            write_reputation_cache_expiry(env, user, contract, expiry);
+            Ok(completed)
+        }
+        Ok(Err(_)) => Err(Error::ContractError),
+        Err(_) => Err(Error::ContractError),
+    }
+}
+
+/// Calculate reputation score for a user across all registered external contracts
+pub fn calculate_reputation_score(env: &Env, user: &Address) -> Result<ReputationScore, Error> {
+    let contracts = read_external_contracts(env);
+    let mut total_completions = 0u32;
+    let mut total_weight = 0u32;
+    let mut weighted_score_sum = 0u32;
+    let mut projects_completed = Vec::new(env);
+
+    for contract_config in contracts.iter() {
+        match query_external_completion(env, user, &contract_config.contract_address, &contract_config.query_function) {
+            Ok(true) => {
+                total_completions += 1;
+                total_weight += contract_config.weight;
+                weighted_score_sum += 100 * contract_config.weight; // Assume 100% completion score
+                projects_completed.push_back(contract_config.contract_address.clone());
+            }
+            Ok(false) => {
+                // No completion, but still count in total_weight for average calculation
+                total_weight += contract_config.weight;
+            }
+            Err(_) => {
+                // Contract query failed, skip this contract
+                continue;
+            }
+        }
+    }
+
+    let average_score = if total_weight > 0 {
+        (weighted_score_sum / total_weight) as u32
+    } else {
+        0
+    };
+
+    let score = ReputationScore {
+        user: user.clone(),
+        total_completions,
+        average_score,
+        last_updated: env.ledger().timestamp(),
+        projects_completed,
+    };
+
+    // Cache the reputation score
+    write_reputation_score(env, user, &score);
+
+    Ok(score)
+}
+
+/// Calculate reputation-based fee reduction for staking
+/// Returns the reduced stake amount based on reputation score
+pub fn calculate_reputation_stake_discount(env: &Env, user: &Address, base_amount: i128) -> Result<i128, Error> {
+    let reputation = match read_reputation_score(env, user) {
+        Some(score) => {
+            // If score is older than 24 hours, recalculate
+            let now = env.ledger().timestamp();
+            if now - score.last_updated > 86400 {
+                calculate_reputation_score(env, user)?
+            } else {
+                score
+            }
+        }
+        None => calculate_reputation_score(env, user)?,
+    };
+
+    // Calculate discount based on reputation
+    // Higher completion count and average score = higher discount
+    let completion_discount = (reputation.total_completions as i128 * 500_000); // 0.05 XLM per completion
+    let score_discount = (reputation.average_score as i128 * 1_000_000) / 100; // Up to 1 XLM for 100% average
+
+    let total_discount = completion_discount + score_discount;
+    let max_discount = base_amount / 2; // Max 50% discount
+
+    let actual_discount = if total_discount > max_discount {
+        max_discount
+    } else {
+        total_discount
+    };
+
+    Ok(base_amount - actual_discount)
+}
+
+/// Get reputation score for a user (public function)
+pub fn get_reputation_score(env: Env, user: Address) -> Result<ReputationScore, Error> {
+    match read_reputation_score(&env, &user) {
+        Some(score) => {
+            // Check if score needs refresh
+            let now = env.ledger().timestamp();
+            if now - score.last_updated > 86400 {
+                calculate_reputation_score(&env, &user)
+            } else {
+                Ok(score)
+            }
+        }
+        None => calculate_reputation_score(&env, &user),
+    }
+}
+
+// ===== REPUTATION STORAGE FUNCTIONS =====
+
+fn read_reputation_score(env: &Env, user: &Address) -> Option<ReputationScore> {
+    env.storage().instance().get(&DataKey::ReputationScore(user.clone()))
+}
+
+fn write_reputation_score(env: &Env, user: &Address, score: &ReputationScore) {
+    env.storage().instance().set(&DataKey::ReputationScore(user.clone()), score);
+}
+
+fn read_external_contracts(env: &Env) -> Vec<ExternalContractQuery> {
+    env.storage().instance().get(&DataKey::ExternalContracts)
+        .unwrap_or(Vec::new(env))
+}
+
+fn write_external_contracts(env: &Env, contracts: Vec<ExternalContractQuery>) {
+    env.storage().instance().set(&DataKey::ExternalContracts, &contracts);
+}
+
+fn read_reputation_cache(env: &Env, user: &Address, contract: &Address) -> Option<bool> {
+    env.storage().instance().get(&DataKey::ReputationCache(user.clone(), contract.clone()))
+}
+
+fn write_reputation_cache(env: &Env, user: &Address, contract: &Address, completed: bool) {
+    env.storage().instance().set(&DataKey::ReputationCache(user.clone(), contract.clone()), &completed);
+}
+
+fn read_reputation_cache_expiry(env: &Env, user: &Address, contract: &Address) -> Option<u64> {
+    env.storage().instance().get(&DataKey::ReputationCacheExpiry(user.clone(), contract.clone()))
+}
+
+fn write_reputation_cache_expiry(env: &Env, user: &Address, contract: &Address, expiry: u64) {
+    env.storage().instance().set(&DataKey::ReputationCacheExpiry(user.clone(), contract.clone()), &expiry);
+}
+
+#[cfg(test)]
+mod test_reputation_scoring;
 #[cfg(test)]
 mod test;
 #[cfg(test)]
