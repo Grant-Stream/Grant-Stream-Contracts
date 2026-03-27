@@ -396,5 +396,67 @@ fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundarie
     assert_eq!(grant.claimable, 150 * SCALING_FACTOR);
 }
 
+#[test]
+fn test_protocol_pause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_timestamp(&env, 0);
+
+    let admin = Address::generate(&env);
+    let grantee = Address::generate(&env);
+    let token_address = setup_token(&env, &admin, 1_000_000);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    // Initialize contract
+    client.initialize(&admin, &token_address, &admin, &admin, &token_address);
+
+    // Set up protocol admins (7 admins)
+    let mut admins = Vec::new(&env);
+    for _ in 0..7 {
+        admins.push_back(Address::generate(&env));
+    }
+    client.set_protocol_admins(&admin, &admins);
+
+    // Create a grant
+    let grant_id = 1;
+    client.create_grant(&grant_id, &grantee, &1000, &10, &0, &1, &1, &0);
+
+    // Try to withdraw before pause - should work
+    set_timestamp(&env, 100);
+    client.withdraw(&grant_id, &grantee);
+
+    // Sign protocol pause with 5 admins
+    for i in 0..5 {
+        let signer = admins.get(i).unwrap();
+        client.sign_protocol_pause(&signer);
+    }
+
+    // Check that protocol is paused
+    let (paused, sig_count) = client.get_protocol_pause_status();
+    assert!(paused);
+    assert_eq!(sig_count, 5);
+
+    // Try to create new grant - should fail
+    let result = client.try_create_grant(&2, &grantee, &1000, &10, &0, &1, &1, &0);
+    assert!(result.is_err());
+
+    // Try to withdraw - should fail
+    let result = client.try_withdraw(&grant_id, &grantee);
+    assert!(result.is_err());
+
+    // Unpause with any admin
+    let unpauser = admins.get(0).unwrap();
+    client.unpause_protocol(&unpauser);
+
+    // Check that protocol is unpaused
+    let (paused, _) = client.get_protocol_pause_status();
+    assert!(!paused);
+
+    // Now operations should work again
+    client.create_grant(&2, &grantee, &1000, &10, &0, &1, &1, &0);
+    client.withdraw(&grant_id, &grantee);
+}
 
 }
