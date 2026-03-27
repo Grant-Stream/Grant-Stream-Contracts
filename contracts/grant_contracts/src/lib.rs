@@ -47,6 +47,11 @@ const MAX_MILESTONE_REASON_LENGTH: u32 = 1000; // Maximum milestone claim reason
 const MAX_CHALLENGE_REASON_LENGTH: u32 = 1000; // Maximum challenge reason length
 const MAX_EVIDENCE_LENGTH: u32 = 2000; // Maximum evidence string length
 
+// Grant Amendment Challenge Period constants
+const AMENDMENT_CHALLENGE_WINDOW: u64 = 7 * 24 * 60 * 60; // 7 days amendment challenge window
+const MAX_AMENDMENT_REASON_LENGTH: u32 = 1000; // Maximum amendment reason length
+const MIN_RAGE_QUIT_VESTED_PERCENTAGE: u32 = 1000; // 10% minimum vested percentage for rage quit
+
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
 // Core logic is now in this file.
@@ -313,6 +318,63 @@ pub enum StreamType {
     FixedAmount,
     FixedEndDate,
     TimeLockedLease,  // NEW: Lease stream to lessor address
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum AmendmentStatus {
+    Proposed,      // Amendment proposed, challenge window open
+    Challenged,   // Grantee challenged the amendment
+    Approved,     // Challenge window passed, amendment approved
+    Rejected,     // Amendment rejected by appeal or DAO vote
+    Executed,     // Amendment successfully executed
+    Cancelled,    // Amendment cancelled by proposer
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum AmendmentType {
+    FlowRateChange,     // Change in flow rate
+    AmountChange,       // Change in total amount
+    DurationChange,     // Change in stream duration
+    RecipientChange,    // Change in recipient address
+    TokenChange,        // Change in token address
+    Termination,        // Grant termination
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct GrantAmendment {
+    pub amendment_id: u64,
+    pub grant_id: u64,
+    pub proposer: Address,
+    pub amendment_type: AmendmentType,
+    pub old_value: String,  // Serialized old value
+    pub new_value: String,  // Serialized new value
+    pub reason: String,
+    pub proposed_at: u64,
+    pub challenge_deadline: u64,
+    pub status: AmendmentStatus,
+    pub challenge_reason: Option<String>,  // Grantee's challenge reason
+    pub challenged_at: Option<u64>,        // When challenge was filed
+    pub appeal_id: Option<u64>,           // Reference to appeal if challenged
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct AmendmentAppeal {
+    pub appeal_id: u64,
+    pub amendment_id: u64,
+    pub appellant: Address,  // Usually the grantee
+    pub reason: String,
+    pub evidence_hash: [u8; 32],
+    pub created_at: u64,
+    pub voting_deadline: u64,
+    pub status: AppealStatus,
+    pub votes_for: i128,
+    pub votes_against: i128,
+    pub total_eligible_power: i128,
+    pub executed_at: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -602,6 +664,11 @@ enum DataKey {
     BurnedStakes, // Track total burned stakes for transparency
     // Grant Registry keys for on-chain indexing
     GrantRegistry(Address), // Maps landlord (lessor) address to array of grant contract hashes
+    // Grant Amendment keys
+    GrantAmendment(u64), // Maps grant_id to amendment details
+    AmendmentIds, // List of all amendment IDs
+    NextAmendmentId, // Next available amendment ID
+    AmendmentAppeal(u64), // Maps amendment_id to appeal details
 }
 
 #[contracterror]
@@ -681,6 +748,16 @@ pub enum Error {
     // Pause cooldown errors
     PauseCooldownActive = 63,
     InsufficientSuperMajority = 64,
+    // Grant Amendment errors
+    AmendmentNotFound = 65,
+    AmendmentAlreadyExists = 66,
+    AmendmentChallengeWindowActive = 67,
+    AmendmentChallengeWindowExpired = 68,
+    AmendmentNotProposed = 69,
+    AmendmentAlreadyExecuted = 70,
+    InsufficientVestedFunds = 71,
+    AmendmentNotChallenged = 72,
+    InvalidAmendmentReason = 73,
 }
 
 // --- Internal Helpers ---
@@ -3713,6 +3790,224 @@ pub mod grant {
             last_updated: env.ledger().timestamp(),
         }
     }
+
+    // --- Grant Amendment Functions ---
+
+    /// Propose an amendment to a grant with mandatory challenge window
+    /// 
+    /// This function allows the DAO to propose changes to grant terms.
+    /// The grantee has 7 days to challenge the amendment or rage quit.
+    /// 
+    /// # Arguments
+    /// * `grant_id` - The ID of the grant to amend
+    /// * `amendment_type` - Type of amendment being proposed
+    /// * `new_value` - New value for the amended field (serialized)
+    /// * `reason` - Reason for the amendment
+    /// 
+    /// # Returns
+    /// * `u64` - The amendment ID
+    pub fn propose_amendment(
+        env: Env,
+        grant_id: u64,
+        amendment_type: AmendmentType,
+        new_value: String,
+        reason: String,
+    ) -> Result<u64, Error> {
+        require_admin_auth(&env)?;
+
+        // Validate inputs
+        if reason.len() > MAX_AMENDMENT_REASON_LENGTH as usize {
+            return Err(Error::InvalidAmendmentReason);
+        }
+
+        // Check if grant exists and is active
+        let grant = read_grant(&env, grant_id)?;
+        if grant.status != GrantStatus::Active {
+            return Err(Error::InvalidState);
+        }
+
+        // Check if there's already an active amendment for this grant
+        if let Ok(existing_amendment) = read_active_amendment(&env, grant_id) {
+            return Err(Error::AmendmentChallengeWindowActive);
+        }
+
+        // Get the old value based on amendment type
+        let old_value = get_current_field_value(&env, &grant, amendment_type.clone())?;
+
+        // Create amendment
+        let amendment_id = get_next_amendment_id(&env);
+        let amendment = GrantAmendment {
+            amendment_id,
+            grant_id,
+            proposer: env.current_contract_address(),
+            amendment_type,
+            old_value,
+            new_value,
+            reason,
+            proposed_at: env.ledger().timestamp(),
+            challenge_deadline: env.ledger().timestamp() + AMENDMENT_CHALLENGE_WINDOW,
+            status: AmendmentStatus::Proposed,
+            challenge_reason: None,
+            challenged_at: None,
+            appeal_id: None,
+        };
+
+        // Store amendment
+        env.storage().instance().set(&DataKey::GrantAmendment(grant_id), &amendment);
+        
+        // Add to amendment IDs list
+        let mut amendment_ids = read_amendment_ids(&env);
+        amendment_ids.push_back(amendment_id);
+        env.storage().instance().set(&DataKey::AmendmentIds, &amendment_ids);
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("amendment_proposed"),),
+            (amendment_id, grant_id, amendment.amendment_type, amendment.challenge_deadline),
+        );
+
+        Ok(amendment_id)
+    }
+
+    /// Challenge an amendment (grantee only)
+    /// 
+    /// This function allows the grantee to challenge an amendment within the challenge window.
+    /// They can either appeal the change or rage quit with vested funds.
+    /// 
+    /// # Arguments
+    /// * `amendment_id` - The ID of the amendment to challenge
+    /// * `challenge_reason` - Reason for challenging the amendment
+    /// * `appeal` - Whether to appeal (true) or rage quit (false)
+    pub fn challenge_amendment(
+        env: Env,
+        amendment_id: u64,
+        challenge_reason: String,
+        appeal: bool,
+    ) -> Result<(), Error> {
+        let amendment = read_amendment(&env, amendment_id)?;
+        let grant = read_grant(&env, amendment.grant_id)?;
+
+        // Validate caller is the grantee
+        if env.current_contract_address() != grant.recipient {
+            return Err(Error::NotAuthorized);
+        }
+
+        // Check amendment status
+        if amendment.status != AmendmentStatus::Proposed {
+            return Err(Error::AmendmentNotProposed);
+        }
+
+        // Check challenge window
+        if env.ledger().timestamp() > amendment.challenge_deadline {
+            return Err(Error::AmendmentChallengeWindowExpired);
+        }
+
+        if appeal {
+            // Create appeal
+            create_amendment_appeal(&env, &amendment, &challenge_reason)?;
+            
+            // Update amendment status
+            let mut updated_amendment = amendment;
+            updated_amendment.status = AmendmentStatus::Challenged;
+            updated_amendment.challenge_reason = Some(challenge_reason);
+            updated_amendment.challenged_at = Some(env.ledger().timestamp());
+            env.storage().instance().set(&DataKey::GrantAmendment(amendment.grant_id), &updated_amendment);
+
+            // Emit event
+            env.events().publish(
+                (symbol_short!("amendment_appealed"),),
+                (amendment_id, amendment.grant_id),
+            );
+        } else {
+            // Rage quit - calculate vested funds and terminate grant
+            let vested_amount = calculate_vested_amount(&env, &grant)?;
+            
+            if vested_amount < (grant.total_amount * MIN_RAGE_QUIT_VESTED_PERCENTAGE as i128) / 10000 {
+                return Err(Error::InsufficientVestedFunds);
+            }
+
+            // Transfer vested funds to grantee
+            let token_client = token::Client::new(&env, &grant.token_address);
+            token_client.transfer(&env.current_contract_address(), &grant.recipient, &vested_amount);
+
+            // Update grant status
+            let mut updated_grant = grant;
+            updated_grant.status = GrantStatus::RageQuitted;
+            env.storage().instance().set(&DataKey::Grant(amendment.grant_id), &updated_grant);
+
+            // Update amendment status
+            let mut updated_amendment = amendment;
+            updated_amendment.status = AmendmentStatus::Rejected;
+            updated_amendment.challenge_reason = Some(challenge_reason);
+            updated_amendment.challenged_at = Some(env.ledger().timestamp());
+            env.storage().instance().set(&DataKey::GrantAmendment(amendment.grant_id), &updated_amendment);
+
+            // Emit event
+            env.events().publish(
+                (symbol_short!("amendment_rage_quit"),),
+                (amendment_id, amendment.grant_id, vested_amount),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Execute an amendment after challenge window expires
+    /// 
+    /// This function executes the amendment if it wasn't challenged.
+    /// 
+    /// # Arguments
+    /// * `amendment_id` - The ID of the amendment to execute
+    pub fn execute_amendment(env: Env, amendment_id: u64) -> Result<(), Error> {
+        let amendment = read_amendment(&env, amendment_id)?;
+
+        // Check if amendment is ready for execution
+        if amendment.status != AmendmentStatus::Proposed {
+            return Err(Error::AmendmentNotProposed);
+        }
+
+        // Check challenge window has expired
+        if env.ledger().timestamp() <= amendment.challenge_deadline {
+            return Err(Error::AmendmentChallengeWindowActive);
+        }
+
+        // Execute the amendment
+        execute_amendment_change(&env, &amendment)?;
+
+        // Update amendment status
+        let mut updated_amendment = amendment;
+        updated_amendment.status = AmendmentStatus::Executed;
+        env.storage().instance().set(&DataKey::GrantAmendment(amendment.grant_id), &updated_amendment);
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("amendment_executed"),),
+            (amendment_id, amendment.grant_id),
+        );
+
+        Ok(())
+    }
+
+    /// Get amendment details
+    pub fn get_amendment(env: Env, amendment_id: u64) -> Result<GrantAmendment, Error> {
+        read_amendment(&env, amendment_id)
+    }
+
+    /// Get all amendments for a grant
+    pub fn get_grant_amendments(env: Env, grant_id: u64) -> Result<Vec<u64>, Error> {
+        let amendment_ids = read_amendment_ids(&env);
+        let mut grant_amendments = Vec::new(&env);
+        
+        for id in amendment_ids.iter() {
+            if let Ok(amendment) = read_amendment(&env, id) {
+                if amendment.grant_id == grant_id {
+                    grant_amendments.push_back(id);
+                }
+            }
+        }
+        
+        Ok(grant_amendments)
+    }
 }
 
 fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
@@ -3722,6 +4017,151 @@ fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i
         &Symbol::new(env, "on_withdraw"),
         args,
     );
+}
+
+// --- Amendment Helper Functions ---
+
+fn read_amendment(env: &Env, amendment_id: u64) -> Result<GrantAmendment, Error> {
+    // Read all amendments and find the one with matching ID
+    let amendment_ids = read_amendment_ids(env);
+    for id in amendment_ids.iter() {
+        if let Ok(amendment) = env.storage().instance().get::<DataKey, GrantAmendment>(&DataKey::GrantAmendment(id)) {
+            if amendment.amendment_id == amendment_id {
+                return Ok(amendment);
+            }
+        }
+    }
+    Err(Error::AmendmentNotFound)
+}
+
+fn read_active_amendment(env: &Env, grant_id: u64) -> Result<GrantAmendment, Error> {
+    if let Some(amendment) = env.storage().instance().get::<DataKey, GrantAmendment>(&DataKey::GrantAmendment(grant_id)) {
+        if amendment.status == AmendmentStatus::Proposed {
+            return Ok(amendment);
+        }
+    }
+    Err(Error::AmendmentNotFound)
+}
+
+fn read_amendment_ids(env: &Env) -> Vec<u64> {
+    env.storage().instance()
+        .get(&DataKey::AmendmentIds)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn get_next_amendment_id(env: &Env) -> u64 {
+    let next_id = env.storage().instance()
+        .get(&DataKey::NextAmendmentId)
+        .unwrap_or(1);
+    
+    env.storage().instance().set(&DataKey::NextAmendmentId, &(next_id + 1));
+    
+    next_id
+}
+
+fn get_current_field_value(env: &Env, grant: &Grant, amendment_type: AmendmentType) -> Result<String, Error> {
+    let value = match amendment_type {
+        AmendmentType::FlowRateChange => grant.flow_rate.to_string(),
+        AmendmentType::AmountChange => grant.total_amount.to_string(),
+        AmendmentType::DurationChange => grant.stream_duration.to_string(),
+        AmendmentType::RecipientChange => grant.recipient.to_string(),
+        AmendmentType::TokenChange => grant.token_address.to_string(),
+        AmendmentType::Termination => "active".to_string(),
+    };
+    Ok(String::from_str_slice(env, &value))
+}
+
+fn calculate_vested_amount(env: &Env, grant: &Grant) -> Result<i128, Error> {
+    let current_time = env.ledger().timestamp();
+    
+    if current_time <= grant.cliff_end {
+        return Ok(0);
+    }
+    
+    let elapsed = current_time.saturating_sub(grant.stream_start);
+    let total_duration = grant.stream_duration;
+    
+    if elapsed >= total_duration {
+        return Ok(grant.total_amount);
+    }
+    
+    let vested = (grant.total_amount * elapsed as i128) / total_duration as i128;
+    Ok(vested.min(grant.total_amount))
+}
+
+fn execute_amendment_change(env: &Env, amendment: &GrantAmendment) -> Result<(), Error> {
+    let mut grant = read_grant(env, amendment.grant_id)?;
+    
+    match amendment.amendment_type {
+        AmendmentType::FlowRateChange => {
+            let value_str = amendment.new_value.to_string();
+            let new_flow_rate = value_str.parse::<i128>()
+                .map_err(|_| Error::InvalidAmount)?;
+            grant.flow_rate = new_flow_rate;
+        },
+        AmendmentType::AmountChange => {
+            let value_str = amendment.new_value.to_string();
+            let new_amount = value_str.parse::<i128>()
+                .map_err(|_| Error::InvalidAmount)?;
+            grant.total_amount = new_amount;
+        },
+        AmendmentType::DurationChange => {
+            let value_str = amendment.new_value.to_string();
+            let new_duration = value_str.parse::<u64>()
+                .map_err(|_| Error::InvalidAmount)?;
+            grant.stream_duration = new_duration;
+        },
+        AmendmentType::RecipientChange => {
+            // This would require address parsing
+            // For now, we'll skip this implementation
+            return Err(Error::NotAuthorized);
+        },
+        AmendmentType::TokenChange => {
+            // This would require address parsing
+            // For now, we'll skip this implementation
+            return Err(Error::NotAuthorized);
+        },
+        AmendmentType::Termination => {
+            grant.status = GrantStatus::Cancelled;
+        },
+    }
+    
+    env.storage().instance().set(&DataKey::Grant(amendment.grant_id), &grant);
+    Ok(())
+}
+
+fn create_amendment_appeal(env: &Env, amendment: &GrantAmendment, reason: &str) -> Result<(), Error> {
+    use super::grant_appeals::{AppealStatus, GrantAppeal};
+    
+    let appeal_id = get_next_appeal_id(env);
+    let appeal = GrantAppeal {
+        appeal_id,
+        amendment_id: amendment.amendment_id,
+        appellant: env.current_contract_address(),
+        reason: String::from_str_slice(env, reason),
+        evidence_hash: [0u8; 32], // Default hash for now
+        created_at: env.ledger().timestamp(),
+        voting_deadline: env.ledger().timestamp() + AMENDMENT_CHALLENGE_WINDOW,
+        status: AppealStatus::Proposed,
+        votes_for: 0,
+        votes_against: 0,
+        total_eligible_power: 0,
+        executed_at: None,
+    };
+    
+    env.storage().instance().set(&DataKey::AmendmentAppeal(amendment.amendment_id), &appeal);
+    
+    // Update amendment with appeal reference
+    let mut updated_amendment = amendment.clone();
+    updated_amendment.appeal_id = Some(appeal_id);
+    env.storage().instance().set(&DataKey::GrantAmendment(amendment.grant_id), &updated_amendment);
+    
+    Ok(())
+}
+
+fn get_next_appeal_id(env: &Env) -> u64 {
+    // Simple implementation - in production this would be more sophisticated
+    env.ledger().sequence
 }
 
 #[cfg(test)]
