@@ -59,7 +59,7 @@ const MAX_EVIDENCE_LENGTH: u32 = 2000; // Maximum evidence string length
 
 pub mod temporal_guard;
 pub mod stream_nft;
-pub mod governance;
+pub mod multi_token_matching;
 pub mod sub_dao_authority;
 pub mod grant_appeals;
 pub mod wasm_hash_verification;
