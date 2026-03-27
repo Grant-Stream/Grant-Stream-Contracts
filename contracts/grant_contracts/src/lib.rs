@@ -57,7 +57,8 @@ const MAX_EVIDENCE_LENGTH: u32 = 2000; // Maximum evidence string length
 // Submodules removed for consolidation and to fix compilation errors.
 // Core logic is now in this file.
 
-pub mod atomic_bridge;
+pub mod temporal_guard;
+pub mod stream_nft;
 pub mod governance;
 pub mod sub_dao_authority;
 pub mod grant_appeals;
@@ -81,7 +82,7 @@ mod test_pause_cooldown;
 #[cfg(test)]
 mod test_grant_appeals;
 #[cfg(test)]
-mod test_temporal_guard;
+mod test_stream_nft;
 /// Get the next available grant ID
 ///
 /// This function finds the next unused grant ID by checking existing grants.
@@ -825,8 +826,10 @@ pub enum DataKey {
     DonorRecord(u64, Address), // Maps grant_id + donor to contribution amount
     GrantDonors(u64),          // List of donors for a grant
     
-    // Task #183: Cross-Contract Flash Loan Protection
-    TemporalGuardContract, // Address of the Temporal Guard contract
+    // Task #184: Stream NFT Wrapping for Secondary Liquidity
+    StreamNFTContract, // Address of the Stream NFT contract
+    WrappedStreamNFT(u64), // Maps grant_id to NFT token_id
+    StreamNFTBeneficiary(u64), // Maps grant_id to current NFT holder
 }
 
 #[contracterror]
@@ -873,7 +876,47 @@ pub enum Error {
     NoStakeToSlash = 34,
     PauseCooldownActive = 63,
     InsufficientSuperMajority = 64,
-
+    // Gas buffer errors
+    InsufficientGasBuffer = 65,
+    GasBufferNotEnabled = 66,
+    // Self-destruct errors
+    SelfDestructConditionsNotMet = 67,
+    GrantsNotCompleted = 68,
+    BalancesNotZero = 69,
+    // Joint grant errors
+    NotJointGrantRecipient = 70,
+    DualSignatureRequired = 71,
+    AlreadySigned = 72,
+    InvalidSharePercentage = 73,
+    CannotSplitActiveGrant = 74,
+    
+    // Task 1: Withdraw All errors
+    ClawbackWindowActive = 65,
+    WithdrawalBuffered = 66,
+    InvalidWithdrawalAmount = 67,
+    
+    // Task 2: Financial Statement errors
+    StatementNotFound = 68,
+    InvalidStatementData = 69,
+    
+    // Task 3: Clawback errors  
+    ClawbackExpired = 70,
+    ClawbackNotAuthorized = 71,
+    FundsAlreadyReleased = 72,
+    
+    // Task 4: Cross-Asset Matching errors
+    PriceOracleNotFound = 73,
+    InsufficientMatchingPool = 74,
+    PriceVolatilityExceeded = 75,
+    InvalidPriceBuffer = 76,
+    
+    // Task #184: Stream NFT Wrapping errors
+    StreamNFTNotFound = 77,
+    StreamAlreadyWrapped = 78,
+    StreamNotWrapped = 79,
+    InvalidDiscountRate = 80,
+    NFTTransferFailed = 81,
+    StreamExpired = 82,
 }
 
 // --- Internal Helpers ---
