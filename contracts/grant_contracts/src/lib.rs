@@ -76,6 +76,7 @@ pub mod sub_dao_authority;
 pub mod grant_appeals;
 pub mod wasm_hash_verification;
 pub mod cross_chain_metadata;
+pub mod temporal_guard;
 
 // --- Test Modules ---
 #[cfg(test)]
@@ -92,6 +93,8 @@ mod test_optimistic_milestones;
 mod test_pause_cooldown;
 #[cfg(test)]
 mod test_grant_appeals;
+#[cfg(test)]
+mod test_temporal_guard;
 /// Get the next available grant ID
 ///
 /// This function finds the next unused grant ID by checking existing grants.
@@ -103,12 +106,12 @@ pub fn get_next_grant_id(env: Env) -> u64 {
         return 1;
     }
 
-#[contracttype]
-pub enum DataKey {
-    Grant(Symbol),
-    Milestone(Symbol, Symbol),
-    MilestoneVote(Symbol, Symbol, Address),
-    Withdrawn(Symbol, Address),
+    let mut max_id = 0u64;
+    for id in grant_ids.iter() {
+        if id > max_id {
+            max_id = id;
+        }
+    }
     max_id + 1
 }
 
@@ -767,7 +770,12 @@ impl From<GrantError> for soroban_sdk::Error {
             GrantError::InvalidGrantee => soroban_sdk::Error::from_contract_error(12),
             GrantError::InvalidStreamConfig => soroban_sdk::Error::from_contract_error(13),
             GrantError::InvalidAccelerationConfig => soroban_sdk::Error::from_contract_error(14),
-enum DataKey {
+        }
+    }
+}
+
+#[contracttype]
+pub enum DataKey {
     Admin,
     GrantToken,
     GrantIds,
@@ -830,6 +838,9 @@ enum DataKey {
     // Task #192: Batch refund tracking
     DonorRecord(u64, Address), // Maps grant_id + donor to contribution amount
     GrantDonors(u64),          // List of donors for a grant
+    
+    // Task #183: Cross-Contract Flash Loan Protection
+    TemporalGuardContract, // Address of the Temporal Guard contract
 }
 
 #[contracterror]
@@ -850,8 +861,8 @@ pub enum Error {
     GranteeMismatch = 12,
     GrantNotInactive = 13,
     WithdrawalLimitExceeded = 200, // Task #193
-}
-
+    TemporalGuardViolation = 201, // Task #183: Flash loan protection
+    
     // Lease-related errors
     InvalidLeaseTerms = 14,
     LeaseAlreadyTerminated = 15,
@@ -1239,6 +1250,71 @@ fn calculate_voting_results(env: &Env, proposal: &SlashingProposal) -> (bool, bo
     (participation_met, approval_met)
 }
 
+// --- Temporal Guard Helper Functions (Task #183) ---
+
+fn get_temporal_guard_contract(env: &Env) -> Result<Address, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::TemporalGuardContract)
+        .ok_or(Error::NotInitialized)
+}
+
+fn set_temporal_guard_contract(env: &Env, address: &Address) {
+    env.storage().instance().set(&DataKey::TemporalGuardContract, address);
+}
+
+fn check_withdrawal_temporal_guard(env: &Env, recipient: &Address, grant_id: u64) -> Result<(), Error> {
+    let temporal_guard = get_temporal_guard_contract(env)?;
+    
+    // Create a client for the temporal guard contract
+    let guard_client = crate::temporal_guard::TemporalGuardContractClient::new(env, &temporal_guard);
+    
+    // Check if withdrawal is allowed
+    guard_client.check_withdraw_allowed(&recipient.clone(), &grant_id)
+        .map_err(|_| Error::TemporalGuardViolation)?;
+    
+    Ok(())
+}
+
+fn record_withdrawal_temporal_guard(env: &Env, recipient: &Address, grant_id: u64) -> Result<(), Error> {
+    let temporal_guard = get_temporal_guard_contract(env)?;
+    
+    // Create a client for the temporal guard contract
+    let guard_client = crate::temporal_guard::TemporalGuardContractClient::new(env, &temporal_guard);
+    
+    // Record the successful withdrawal
+    guard_client.record_withdrawal(&recipient.clone(), &grant_id)
+        .map_err(|_| Error::TemporalGuardViolation)?;
+    
+    Ok(())
+}
+
+fn check_vote_temporal_guard(env: &Env, voter: &Address, proposal_id: u64) -> Result<(), Error> {
+    let temporal_guard = get_temporal_guard_contract(env)?;
+    
+    // Create a client for the temporal guard contract
+    let guard_client = crate::temporal_guard::TemporalGuardContractClient::new(env, &temporal_guard);
+    
+    // Check if voting is allowed
+    guard_client.check_vote_allowed(&voter.clone(), &proposal_id)
+        .map_err(|_| Error::TemporalGuardViolation)?;
+    
+    Ok(())
+}
+
+fn record_vote_temporal_guard(env: &Env, voter: &Address, proposal_id: u64) -> Result<(), Error> {
+    let temporal_guard = get_temporal_guard_contract(env)?;
+    
+    // Create a client for the temporal guard contract
+    let guard_client = crate::temporal_guard::TemporalGuardContractClient::new(env, &temporal_guard);
+    
+    // Record the successful vote
+    guard_client.record_vote(&voter.clone(), &proposal_id)
+        .map_err(|_| Error::TemporalGuardViolation)?;
+    
+    Ok(())
+}
+
 // --- Milestone System Helper Functions ---
 
 fn read_next_milestone_claim_id(env: &Env) -> u64 {
@@ -1562,6 +1638,21 @@ impl GrantContract {
         Ok(())
     }
 
+    /// Task #183: Set the Temporal Guard contract address (admin only)
+    /// This enables flash loan protection for voting and withdrawal operations
+    pub fn set_temporal_guard_contract(env: Env, admin: Address, temporal_guard_contract: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        env.storage().instance().set(&DataKey::TemporalGuardContract, &temporal_guard_contract);
+        
+        env.events().publish(
+            (symbol_short!("temp_guard_contract_set"),),
+            (admin, temporal_guard_contract),
+        );
+        
+        Ok(())
+    }
+
     /// Task #192: Batch Refund for Failed Grant Rounds
     /// Atomic refund for failed Gitcoin-style rounds. Optimized iterate-and-transfer.
     pub fn batch_refund(env: Env, grant_id: u64) -> Result<(), Error> {
@@ -1598,6 +1689,9 @@ impl GrantContract {
 
     /// Task #193: Grantee Withdrawal Limit Cooldown Logic
     /// Enforces a daily withdrawal cap to prevent unauthorized rapidly draining.
+    /// 
+    /// Enhanced with Task #183: Cross-Contract Flash Loan Protection
+    /// Prevents voting and withdrawal in the same ledger to stop atomic exploits.
     pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
         let mut grant = read_grant(&env, grant_id)?;
         grant.recipient.require_auth();
@@ -1605,6 +1699,9 @@ impl GrantContract {
         if grant.status != GrantStatus::Active {
             return Err(Error::InvalidState);
         }
+
+        // Task #183: Check temporal guard protection before withdrawal
+        check_withdrawal_temporal_guard(&env, &grant.recipient, grant_id)?;
 
         // Settle accruals
         // settle_grant_internal_logic_call(&mut grant, env.ledger().timestamp())?;
@@ -1633,6 +1730,9 @@ impl GrantContract {
         token_client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
 
         write_grant(&env, grant_id, &grant);
+
+        // Task #183: Record successful withdrawal in temporal guard
+        record_withdrawal_temporal_guard(&env, &grant.recipient, grant_id)?;
 
         env.events().publish(
             (symbol_short!("withdraw"), grant_id),
