@@ -396,5 +396,186 @@ fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundarie
     assert_eq!(grant.claimable, 150 * SCALING_FACTOR);
 }
 
+#[test]
+fn test_protocol_pause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_timestamp(&env, 0);
+
+    let admin = Address::generate(&env);
+    let grantee = Address::generate(&env);
+    let token_address = setup_token(&env, &admin, 1_000_000);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    // Initialize contract
+    client.initialize(&admin, &token_address, &admin, &admin, &token_address);
+
+    // Set up protocol admins (7 admins)
+    let mut admins = Vec::new(&env);
+    for _ in 0..7 {
+        admins.push_back(Address::generate(&env));
+    }
+    client.set_protocol_admins(&admin, &admins);
+
+    // Create a grant
+    let grant_id = 1;
+    client.create_grant(&grant_id, &grantee, &1000, &10, &0, &1, &1, &0);
+
+    // Try to withdraw before pause - should work
+    set_timestamp(&env, 100);
+    client.withdraw(&grant_id, &grantee);
+
+    // Sign protocol pause with 5 admins
+    for i in 0..5 {
+        let signer = admins.get(i).unwrap();
+        client.sign_protocol_pause(&signer);
+    }
+
+    // Check that protocol is paused
+    let (paused, sig_count) = client.get_protocol_pause_status();
+    assert!(paused);
+    assert_eq!(sig_count, 5);
+
+    // Try to create new grant - should fail
+    let result = client.try_create_grant(&2, &grantee, &1000, &10, &0, &1, &1, &0);
+    assert!(result.is_err());
+
+    // Try to withdraw - should fail
+    let result = client.try_withdraw(&grant_id, &grantee);
+    assert!(result.is_err());
+
+    // Unpause with any admin
+    let unpauser = admins.get(0).unwrap();
+    client.unpause_protocol(&unpauser);
+
+    // Check that protocol is unpaused
+    let (paused, _) = client.get_protocol_pause_status();
+    assert!(!paused);
+
+    // Now operations should work again
+    client.create_grant(&2, &grantee, &1000, &10, &0, &1, &1, &0);
+    client.withdraw(&grant_id, &grantee);
+}
+
+#[test]
+fn test_arbitration_escrow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_timestamp(&env, 0);
+
+    let admin = Address::generate(&env);
+    let grantee = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+    let token_address = setup_token(&env, &admin, 1_000_000);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    // Initialize contract
+    client.initialize(&admin, &token_address, &admin, &admin, &token_address);
+
+    // Add arbitrator
+    client.add_arbitrator(&admin, &arbitrator);
+
+    // Create a grant
+    let grant_id = 1;
+    client.create_grant(&grant_id, &grantee, &1000, &10, &0, &1, &1, &0);
+
+    // Let some time pass for streaming
+    set_timestamp(&env, 50);
+
+    // Raise dispute
+    let dispute_reason = String::from_str(&env, "Contract breach");
+    client.raise_dispute(&grantee, &grant_id, &dispute_reason);
+
+    // Check grant status
+    let grant = client.get_grant(&grant_id);
+    assert!(matches!(grant.status, GrantStatus::DisputeRaised));
+
+    // Try to withdraw - should fail
+    let result = client.try_withdraw(&grant_id, &grantee);
+    assert!(result.is_err());
+
+    // Assign arbitrator
+    client.assign_arbitrator(&admin, &grant_id, &arbitrator);
+
+    // Check escrow
+    let escrow = client.get_arbitration_escrow(&grant_id).unwrap();
+    assert_eq!(escrow.arbitrator, arbitrator);
+    assert_eq!(escrow.status, ArbitrationStatus::Active);
+
+    // Resolve arbitration (split funds)
+    let resolution = String::from_str(&env, "Partial breach - 60/40 split");
+    client.resolve_arbitration(&arbitrator, &grant_id, &resolution, &600, &400);
+
+    // Check final grant status
+    let grant = client.get_grant(&grant_id);
+    assert!(matches!(grant.status, GrantStatus::ArbitrationResolved));
+
+    // Check escrow status
+    let escrow = client.get_arbitration_escrow(&grant_id).unwrap();
+    assert_eq!(escrow.status, ArbitrationStatus::Resolved);
+}
+
+#[test]
+fn test_balance_optimization() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_timestamp(&env, 0);
+
+    let admin = Address::generate(&env);
+    let grantee = Address::generate(&env);
+    let token_address = setup_token(&env, &admin, 1_000_000);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    // Initialize contract
+    client.initialize(&admin, &token_address, &admin, &admin, &token_address);
+
+    // Create a grant
+    let grant_id = 1;
+    client.create_grant(&grant_id, &grantee, &1000, &10, &0, &1, &1, &0);
+
+    // Let some time pass for streaming
+    set_timestamp(&env, 50);
+
+    // First balance query - should compute and cache
+    let snapshot1 = client.get_balance_optimized(&grant_id).unwrap();
+    assert_eq!(snapshot1.grant_id, grant_id);
+    assert_eq!(snapshot1.total_amount, 1000);
+    assert!(snapshot1.claimable > 0);
+
+    // Second balance query within 30 seconds - should use cache
+    let snapshot2 = client.get_balance_optimized(&grant_id).unwrap();
+    assert_eq!(snapshot1.claimable, snapshot2.claimable); // Should be identical (cached)
+
+    // Withdraw some funds - should invalidate cache
+    client.withdraw(&grant_id, &grantee);
+
+    // Next balance query - should recompute
+    let snapshot3 = client.get_balance_optimized(&grant_id).unwrap();
+    assert!(snapshot3.withdrawn > snapshot2.withdrawn); // Withdrawn amount should increase
+
+    // Test bulk balance query
+    let grant_ids = vec![&env, grant_id];
+    let bulk_snapshots = client.get_bulk_balances_optimized(&grant_ids);
+    assert_eq!(bulk_snapshots.len(), 1);
+    assert_eq!(bulk_snapshots.get(0).unwrap().grant_id, grant_id);
+
+    // Test optimized withdrawable amount
+    let withdrawable = client.get_withdrawable_optimized(&grant_id, &grantee).unwrap();
+    assert!(withdrawable >= 0);
+
+    // Clear cache (admin only)
+    client.clear_balance_cache(&admin, &grant_id);
+
+    // Get cache stats
+    let stats = client.get_cache_stats(&admin).unwrap();
+    assert!(stats.cache_enabled);
+    assert_eq!(stats.cache_ttl_seconds, 30);
+}
 
 }

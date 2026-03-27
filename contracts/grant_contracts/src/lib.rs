@@ -2,20 +2,17 @@
 #![no_std]
 
 use core::cmp::min;
-
 use soroban_sdk::{
-    contract, contractimpl, contracttype, panic_with_error, token, Address, Env, Map, String,
-    Symbol, Vec,
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
-    Symbol, vec, IntoVal, Map,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, 
+    token, Address, Env, Map, String, Symbol, Vec, vec, IntoVal,
 };
 
+// Import custom modules
 use crate::wasm_hash_verification::{WasmHashVerification, VerificationError};
 use crate::cross_chain_metadata::{CrossChainMetadata, MetadataError};
 
 // --- Constants ---
-pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
+pub const SCALING_FACTOR: i128 = 10_000_000; 
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
 const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60;
 const NFT_SUPPLY: i128 = 1000000; // Max NFT supply for completion certificates
@@ -54,17 +51,6 @@ const MAX_MILESTONE_REASON_LENGTH: u32 = 1000; // Maximum milestone claim reason
 const MAX_CHALLENGE_REASON_LENGTH: u32 = 1000; // Maximum challenge reason length
 const MAX_EVIDENCE_LENGTH: u32 = 2000; // Maximum evidence string length
 
-// Task 1 & 3: Withdraw All and Clawback constants
-const CLAWBACK_WINDOW_SECS: u64 = 4 * 60 * 60; // 4 hours clawback window
-const WITHDRAWAL_BUFFER_VERSION: u32 = 1; // Version for withdrawal buffer tracking
-
-// Task 2: Financial Statement constants
-const FINANCIAL_STATEMENT_VERSION: u32 = 1; // Version for financial statements
-
-// Task 4: Cross-Asset Matching constants
-const DEFAULT_PRICE_BUFFER_BPS: u32 = 500; // 5% default price buffer for volatility
-const MAX_PRICE_DEVIATION_BPS: u32 = 1000; // 10% maximum price deviation allowed
-const DEX_PRICE_EXPIRY_SECS: u64 = 300; // 5 minutes DEX price expiry
 
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
@@ -79,6 +65,7 @@ pub mod sub_dao_authority;
 pub mod grant_appeals;
 pub mod wasm_hash_verification;
 pub mod cross_chain_metadata;
+pub mod temporal_guard;
 
 // --- Test Modules ---
 #[cfg(test)]
@@ -95,6 +82,8 @@ mod test_optimistic_milestones;
 mod test_pause_cooldown;
 #[cfg(test)]
 mod test_grant_appeals;
+#[cfg(test)]
+mod test_stream_nft;
 /// Get the next available grant ID
 ///
 /// This function finds the next unused grant ID by checking existing grants.
@@ -106,12 +95,12 @@ pub fn get_next_grant_id(env: Env) -> u64 {
         return 1;
     }
 
-#[contracttype]
-pub enum DataKey {
-    Grant(Symbol),
-    Milestone(Symbol, Symbol),
-    MilestoneVote(Symbol, Symbol, Address),
-    Withdrawn(Symbol, Address),
+    let mut max_id = 0u64;
+    for id in grant_ids.iter() {
+        if id > max_id {
+            max_id = id;
+        }
+    }
     max_id + 1
 }
 
@@ -122,8 +111,7 @@ fn require_admin_auth(env: &Env) -> Result<(), Error> {
     Ok(())
 }
 
-fn read_grant_ids(env: &Env) -> Vec<u64> {
-    env.storage().instance().get(&DataKey::GrantIds).unwrap_or_else(|| Vec::new(env))
+    max_id + 1
 }
 /// Advanced batch initialization with multi-asset support and deposit verification
 ///
@@ -326,88 +314,7 @@ pub struct Grant {
         current_grant_id += 1;
     }
 
-    // Update grant IDs list
-    env.storage().instance().set(&DataKey::GrantIds, &grant_ids);
-
-    let result = BatchInitResult {
-        successful_grants: successful_grants.clone(),
-        failed_grants,
-        total_deposited,
-        grants_created: successful_grants.len(),
-    };
-
-    // Emit detailed batch creation event
-    env.events().publish(
-        (symbol_short!("batch_adv"),),
-        (
-            result.grants_created,
-            result.total_deposited,
-            start_id,
-            asset_requirements.len(),
-        ),
-    );
-
-    Ok(result)
-}
-
-/// Task #192: Batch refund for failed grant rounds
-/// Iterates through all DonorRecords and returns their contributions in a single atomic transaction.
-/// Optimized via bulk state fetching if possible, but for Soroban we iterate through stored donor list.
-pub fn batch_refund(env: Env, grant_id: u64) -> Result<(), Error> {
-    require_admin_auth(&env)?;
-    
-    // Check if grant exists and is cancelled or otherwise failed
-    let grant_key = DataKey::Grant(grant_id);
-    let mut grant: Grant = env.storage().instance().get(&grant_key).ok_or(Error::GrantNotFound)?;
-
-    if !has_status_mask(grant.status, GrantStatus::Cancelled) {
-        return Err(Error::InvalidState);
-    }
-
-    // Get list of donors
-    let donors: Vec<Address> = env.storage().instance().get(&DataKey::GrantDonors(grant_id)).unwrap_or_else(|| Vec::new(&env));
-    
-    if donors.is_empty() {
-        return Ok(());
-    }
-
-    let token_client = token::Client::new(&env, &grant.token_address);
-    let mut total_refunded = 0i128;
-
-    // Process refunds atomically
-    // Note: If donors list is very large (e.g. > 100), this might hit gas limits.
-    // In production, consider a multi-stage refund process if donors > 50.
-    for donor in donors.iter() {
-        let record_key = DataKey::DonorRecord(grant_id, donor.clone());
-        let amount: i128 = env.storage().instance().get(&record_key).unwrap_or(0);
-        
-        if amount > 0 {
-            // Transfer back to donor
-            token_client.transfer(&env.current_contract_address(), &donor, &amount);
-            
-            // Clear record to prevent double refund
-            env.storage().instance().remove(&record_key);
-            total_refunded = total_refunded.checked_add(amount).ok_or(Error::MathOverflow)?;
-        }
-    }
-
-    // Clear donor list
-    env.storage().instance().remove(&DataKey::GrantDonors(grant_id));
-
-    env.events().publish(
-        (symbol_short!("batchref"), grant_id),
-        (donors.len(), total_refunded),
-    );
-
-    Ok(())
-}
-
-/// Helper function to check status (assuming GrantStatus has bitflags or similar)
-fn has_status_mask(current_status: GrantStatus, target: GrantStatus) -> bool {
-    current_status == target
-}
-
-// --- Types ---
+// --- Enums ---
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -417,11 +324,14 @@ pub enum GrantStatus {
     Completed,
     RageQuitted,
     Cancelled,
-    // Milestone-related statuses
-    MilestoneClaimed,    // Milestone claimed, in challenge period
-    MilestoneApproved,    // Challenge period passed, funds released
-    MilestoneChallenged,  // Milestone challenged, under review
-    MilestoneRejected,    // Challenge successful, claim rejected
+    Slashed,
+    MilestoneClaimed,
+    MilestoneApproved,
+    MilestoneChallenged,
+    MilestoneRejected,
+    DisputeRaised,
+    ArbitrationPending,
+    ArbitrationResolved,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -430,6 +340,102 @@ pub enum StreamType {
     FixedAmount,
     FixedEndDate,
     TimeLockedLease,  // NEW: Lease stream to lessor address
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum AmendmentStatus {
+    Proposed,      // Amendment proposed, challenge window open
+    Challenged,   // Grantee challenged the amendment
+    Approved,     // Challenge window passed, amendment approved
+    Rejected,     // Amendment rejected by appeal or DAO vote
+    Executed,     // Amendment successfully executed
+    Cancelled,    // Amendment cancelled by proposer
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum AmendmentType {
+    FlowRateChange,     // Change in flow rate
+    AmountChange,       // Change in total amount
+    DurationChange,     // Change in stream duration
+    RecipientChange,    // Change in recipient address
+    TokenChange,        // Change in token address
+    Termination,        // Grant termination
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct GrantAmendment {
+    pub amendment_id: u64,
+    pub grant_id: u64,
+    pub proposer: Address,
+    pub amendment_type: AmendmentType,
+    pub old_value: String,  // Serialized old value
+    pub new_value: String,  // Serialized new value
+    pub reason: String,
+    pub proposed_at: u64,
+    pub challenge_deadline: u64,
+    pub status: AmendmentStatus,
+    pub challenge_reason: Option<String>,  // Grantee's challenge reason
+    pub challenged_at: Option<u64>,        // When challenge was filed
+    pub appeal_id: Option<u64>,           // Reference to appeal if challenged
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct AmendmentAppeal {
+    pub appeal_id: u64,
+    pub amendment_id: u64,
+    pub appellant: Address,  // Usually the grantee
+    pub reason: String,
+    pub evidence_hash: [u8; 32],
+    pub created_at: u64,
+    pub voting_deadline: u64,
+    pub status: AppealStatus,
+    pub votes_for: i128,
+    pub votes_against: i128,
+    pub total_eligible_power: i128,
+    pub executed_at: Option<u64>,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct JurisdictionInfo {
+    pub code: String,           // Jurisdiction code (e.g., "US-CA", "GB-LDN")
+    pub name: String,           // Human-readable name
+    pub tax_withholding_rate: u32, // Tax rate in basis points (1/100 of percent)
+    pub tax_treaty_eligible: bool, // Whether tax treaty benefits apply
+    pub documentation_required: bool, // Whether additional documentation is required
+    pub updated_at: u64,        // Last update timestamp
+    pub updated_by: Address,    // Who updated this jurisdiction
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct GranteeRecord {
+    pub address: Address,           // Grantee's wallet address
+    pub jurisdiction_code: String,   // Tax jurisdiction code
+    pub tax_id: Option<String>,      // Tax identifier (SSN, EIN, etc.)
+    pub tax_treaty_claimed: bool,    // Whether tax treaty benefits are claimed
+    pub verified: bool,              // Whether jurisdiction information is verified
+    pub verification_documents: Option<[u8; 32]>, // Hash of verification documents
+    pub created_at: u64,             // Record creation timestamp
+    pub updated_at: u64,             // Last update timestamp
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct TaxWithholdingRecord {
+    pub grant_id: u64,               // Associated grant ID
+    pub grantee: Address,            // Grantee address
+    pub gross_amount: i128,          // Gross payment amount
+    pub tax_rate: u32,               // Tax withholding rate (basis points)
+    pub tax_withheld: i128,          // Amount withheld for taxes
+    pub net_amount: i128,            // Net amount paid to grantee
+    pub jurisdiction_code: String,   // Jurisdiction used for calculation
+    pub payment_date: u64,           // Payment timestamp
+    pub tax_report_id: Option<u64>,  // Reference to tax report
 }
 
 #[derive(Clone)]
@@ -481,11 +487,6 @@ pub struct Grant {
     // Gas buffer fields for fail-safe withdrawals
     pub gas_buffer: i128, // Pre-paid XLM buffer for high network fee periods
     pub gas_buffer_used: i128, // Amount of gas buffer used so far
-
-    // Task #193: Withdrawal limits
-    pub max_withdrawal_per_day: i128,
-    pub last_withdrawal_timestamp: u64,
-    pub withdrawal_amount_today: i128,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -510,26 +511,6 @@ pub struct GranteeConfig {
     pub milestone_amount: i128,     // Amount per milestone
     pub total_milestones: u32,     // Total number of milestones
     pub gas_buffer: i128,          // Pre-paid XLM buffer for high network fee periods
-}
-
-/// Joint grant configuration for collaborative projects
-#[derive(Clone)]
-#[contracttype]
-pub struct JointGrantConfig {
-    pub primary_recipient: Address,    // Primary grantee address
-    pub secondary_recipient: Address,  // Secondary grantee address
-    pub total_amount: i128,            // Total grant amount
-    pub flow_rate: i128,               // Combined flow rate
-    pub asset: Address,                // Token asset address
-    pub warmup_duration: u64,          // Warmup period
-    pub primary_share_bps: u32,        // Primary recipient's share in basis points (0-10000)
-    pub secondary_share_bps: u32,      // Secondary recipient's share in basis points (0-10000)
-    pub require_dual_signature: bool,  // Whether both signatures are required for withdrawal
-    pub validator: Option<Address>,    // Optional validator address
-    pub linked_addresses: Vec<Address>, // COI: Linked addresses that cannot vote
-    pub milestone_amount: i128,        // Amount per milestone
-    pub total_milestones: u32,         // Total number of milestones
-    pub gas_buffer: i128,              // Pre-paid XLM buffer for high network fee periods
 }
 
 /// Result of batch grant initialization
@@ -736,6 +717,25 @@ pub struct DexPriceUpdate {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct ReputationScore {
+    pub user: Address,
+    pub total_completions: u32,     // Total educational completions across projects
+    pub average_score: u32,         // Average completion score (0-100)
+    pub last_updated: u64,          // Last time reputation was calculated
+    pub projects_completed: Vec<Address>, // List of project contracts completed
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct ExternalContractQuery {
+    pub contract_address: Address,
+    pub query_function: Symbol,     // Function to call (e.g., "get_completion_status")
+    pub project_name: String,       // Human-readable project name
+    pub weight: u32,               // Weight for reputation calculation (1-100)
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub enum GrantError {
     GrantNotFound,
     Unauthorized,
@@ -751,6 +751,49 @@ pub enum GrantError {
     InvalidGrantee,
     InvalidStreamConfig,
     InvalidAccelerationConfig,
+}
+
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct ArbitrationEscrow {
+    pub grant_id: u64,
+    pub escrow_amount: i128,
+    pub dispute_raised_by: Address,
+    pub dispute_reason: String,
+    pub dispute_timestamp: u64,
+    pub arbitrator: Address,
+    pub status: ArbitrationStatus,
+    pub resolution: Option<String>,
+    pub resolution_timestamp: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum ArbitrationStatus {
+    Pending,      // Awaiting arbitrator assignment
+    Active,       // Under active arbitration
+    Resolved,     // Arbitration completed
+    Cancelled,    // Dispute cancelled
+}
+
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct GrantBalanceSnapshot {
+    pub grant_id: u64,
+    pub total_amount: i128,
+    pub withdrawn: i128,
+    pub claimable: i128,
+    pub remaining: i128,
+    pub last_updated: u64,
+    pub status: GrantStatus,
+}
+
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct CacheStats {
+    pub cache_enabled: bool,
+    pub cache_ttl_seconds: u32,
+    pub estimated_hit_rate: u32, // Percentage
 }
 
 impl From<GrantError> for soroban_sdk::Error {
@@ -770,7 +813,12 @@ impl From<GrantError> for soroban_sdk::Error {
             GrantError::InvalidGrantee => soroban_sdk::Error::from_contract_error(12),
             GrantError::InvalidStreamConfig => soroban_sdk::Error::from_contract_error(13),
             GrantError::InvalidAccelerationConfig => soroban_sdk::Error::from_contract_error(14),
-enum DataKey {
+        }
+    }
+}
+
+#[contracttype]
+pub enum DataKey {
     Admin,
     GrantToken,
     GrantIds,
@@ -813,22 +861,6 @@ enum DataKey {
     BurnedStakes, // Track total burned stakes for transparency
     // Grant Registry keys for on-chain indexing
     GrantRegistry(Address), // Maps landlord (lessor) address to array of grant contract hashes
-    // Gas buffer keys
-    GasBuffer(u64), // Maps grant_id to gas buffer balance
-    // Joint grant keys
-    JointGrant(u64), // Maps grant_id to joint grant configuration
-    JointGrantWithdrawalPending(u64, Address), // Maps grant_id + signer to pending withdrawal status
-    
-    // Task 1: Withdraw All - Multi-grant withdrawal tracking
-    WithdrawalBuffer(u64, Address), // Maps grant_id + recipient to buffered withdrawal amount
-    ClawbackWindow(u64), // Maps grant_id to clawback window end timestamp
-    
-    // Task 2: Financial Statement - Certified records
-    FinancialStatementNonce(u64), // Maps grant_id to nonce for statement generation
-    
-    // Task 4: Cross-Asset Matching - DEX price tracking
-    MatchingPool(Address), // Maps pool token address to matching pool info
-    DexPriceBuffer, // Latest DEX price buffer for volatility protection
 
     // Task #192: Batch refund tracking
     DonorRecord(u64, Address), // Maps grant_id + donor to contribution amount
@@ -850,8 +882,6 @@ pub enum Error {
     AlreadyInitialized = 2,
     NotAuthorized = 3,
     GrantNotFound = 4,
-    GrantAlreadyExists = 5,
-    InvalidRate = 6,
     InvalidAmount = 7,
     InvalidState = 8,
     MathOverflow = 9,
@@ -860,8 +890,8 @@ pub enum Error {
     GranteeMismatch = 12,
     GrantNotInactive = 13,
     WithdrawalLimitExceeded = 200, // Task #193
-}
-
+    TemporalGuardViolation = 201, // Task #183: Flash loan protection
+    
     // Lease-related errors
     InvalidLeaseTerms = 14,
     LeaseAlreadyTerminated = 15,
@@ -886,74 +916,9 @@ pub enum Error {
     ParticipationThresholdNotMet = 32,
     ApprovalThresholdNotMet = 33,
     NoStakeToSlash = 34,
-    SlashingAlreadyExecuted = 35,
-    InvalidReasonLength = 36,
-    // Proposal Staking Escrow errors
-    InsufficientStake = 37,
-    StakeAlreadyDeposited = 38,
-    StakeNotDeposited = 39,
-    StakeAlreadyReturned = 40,
-    StakeAlreadyBurned = 41,
-    InvalidStakeAmount = 42,
-    // Sub-DAO Authority errors
-    SubDaoActionNotAllowed = 43,
-    SubDaoPermissionRevoked = 44,
-    SubDaoActionVetoed = 45,
-    SubDaoContractNotSet = 46,
-    // COI (Conflict of Interest) errors
-    VoterHasConflictOfInterest = 47,
-    LinkedAddressAlreadyExists = 48,
-    LinkedAddressNotFound = 49,
-    CannotVoteOnOwnGrant = 50,
-    ExcludedFromVoting = 51,
-    // Milestone system errors
-    MilestoneNotFound = 52,
-    MilestoneAlreadyClaimed = 53,
-    InvalidMilestoneNumber = 54,
-    ChallengeNotFound = 55,
-    ChallengeAlreadyExists = 56,
-    ChallengePeriodExpired = 57,
-    ChallengeNotActive = 58,
-    InvalidChallengeStatus = 59,
-    InsufficientMilestoneFunds = 60,
-    MilestoneNotClaimed = 61,
-    MilestoneAlreadyChallenged = 62,
-    // Pause cooldown errors
     PauseCooldownActive = 63,
     InsufficientSuperMajority = 64,
-    // Gas buffer errors
-    InsufficientGasBuffer = 65,
-    GasBufferNotEnabled = 66,
-    // Self-destruct errors
-    SelfDestructConditionsNotMet = 67,
-    GrantsNotCompleted = 68,
-    BalancesNotZero = 69,
-    // Joint grant errors
-    NotJointGrantRecipient = 70,
-    DualSignatureRequired = 71,
-    AlreadySigned = 72,
-    InvalidSharePercentage = 73,
-    CannotSplitActiveGrant = 74,
-    
-    // Task 1: Withdraw All errors
-    ClawbackWindowActive = 65,
-    WithdrawalBuffered = 66,
-    InvalidWithdrawalAmount = 67,
-    
-    // Task 2: Financial Statement errors
-    StatementNotFound = 68,
-    InvalidStatementData = 69,
-    
-    // Task 3: Clawback errors  
-    ClawbackExpired = 70,
-    ClawbackNotAuthorized = 71,
-    FundsAlreadyReleased = 72,
-    
-    // Task 4: Cross-Asset Matching errors
-    PriceOracleNotFound = 73,
-    InsufficientMatchingPool = 74,
-    PriceVolatilityExceeded = 75,
-    InvalidPriceBuffer = 76,
+
 }
 
 // --- Internal Helpers ---
@@ -1007,141 +972,92 @@ fn read_sub_dao_authority_contract(env: &Env) -> Result<Address, Error> {
 fn check_sub_dao_permission(env: &Env, caller: &Address, grant_id: u64, action: &str) -> Result<(), Error> {
     let sub_dao_contract = read_sub_dao_authority_contract(env)?;
     
-    // This would be a contract call to check permissions
-    // For now, we'll implement basic logic here
-    // In production, this would call SubDaoAuthority::validate_sub_dao_action
+    // Unified from main & feat/Grant
+    pub gas_buffer: i128,
+    pub gas_buffer_used: i128,
+    pub max_withdrawal_per_day: i128,
+    pub last_withdrawal_timestamp: u64,
+    pub withdrawal_amount_today: i128,
     
-    // Check if caller manages this grant
-    // Note: In a real implementation, this would query the Sub-DAO authority contract
-    // For now, we'll use a simplified approach
+    // Arbitration Escrow fields
+    pub escrow_amount: i128,
+    pub arbitrator: Option<Address>,
+    pub dispute_reason: Option<String>,
     
-    Err(Error::SubDaoActionNotAllowed) // Default to not allowed until proper integration
+    // Lease fields
+    pub lessor: Address,
+    pub lease_terminated: bool,
+    pub last_resume_timestamp: Option<u64>,
 }
 
-fn read_grant_ids(env: &Env) -> Vec<u64> {
-    env.storage()
-        .instance()
-        .get(&DataKey::GrantIds)
-        .unwrap_or_else(|| Vec::new(env))
+#[derive(Clone)]
+#[contracttype]
+pub struct GranteeConfig {
+    pub recipient: Address,
+    pub total_amount: i128,
+    pub flow_rate: i128,
+    pub asset: Address,
+    pub warmup_duration: u64,
+    pub validator: Option<Address>,
+    pub gas_buffer: i128,
 }
 
-// Lease Helper Functions
-fn read_lease_agreement(env: &Env, grant_id: u64) -> Result<(Address, String, String, i128, u64), Error> {
-    env.storage()
-        .instance()
-        .get(&DataKey::LeaseAgreement(grant_id))
-        .ok_or(Error::GrantNotFound)
-}
+// --- Implementation ---
 
-fn write_lease_agreement(env: &Env, grant_id: u64, lessor: &Address, property_id: &str, serial_number: &str, security_deposit: i128, lease_end_time: u64) {
-    let agreement = (lessor.clone(), String::from_str(env, property_id), String::from_str(env, serial_number), security_deposit, lease_end_time);
-    env.storage().instance().set(&DataKey::LeaseAgreement(grant_id), &agreement);
-}
+#[contract]
+pub struct GrantContract;
 
-fn read_property_history(env: &Env, property_id: &str) -> Vec<(u64, Address, u64)> {
-    env.storage()
-        .instance()
-        .get(&DataKey::PropertyRegistry(String::from_str(env, property_id)))
-        .unwrap_or_else(|| Vec::new(env))
-}
-
-fn write_property_history(env: &Env, property_id: &str, history: &Vec<(u64, Address, u64)>) {
-    env.storage().instance().set(&DataKey::PropertyRegistry(String::from_str(env, property_id)), history);
-}
-
-fn calculate_security_deposit(total_amount: i128, deposit_percentage: i128) -> Result<i128, Error> {
-    if deposit_percentage < MIN_SECURITY_DEPOSIT_PERCENTAGE || deposit_percentage > MAX_SECURITY_DEPOSIT_PERCENTAGE {
-        return Err(Error::InvalidSecurityDeposit);
+#[contractimpl]
+impl GrantContract {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        grant_token: Address,
+        treasury: Address,
+        oracle: Address,
+        native_token: Address,
+    ) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::AlreadyInitialized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::GrantToken, &grant_token);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        env.storage().instance().set(&DataKey::Oracle, &oracle);
+        env.storage().instance().set(&DataKey::NativeToken, &native_token);
+        env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
+        Ok(())
     }
-    
-    let deposit = total_amount
-        .checked_mul(deposit_percentage)
-        .ok_or(Error::MathOverflow)?
-        .checked_div(10000) // Convert from basis points
-        .ok_or(Error::MathOverflow)?;
-    
-    Ok(deposit)
-}
 
-// Financial Snapshot Helper Functions
-fn read_snapshot_nonce(env: &Env, grant_id: u64) -> u64 {
-    env.storage()
-        .instance()
-        .get(&DataKey::SnapshotNonce(grant_id))
-        .unwrap_or(0)
-}
+    pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
 
-fn write_snapshot_nonce(env: &Env, grant_id: u64, nonce: u64) {
-    env.storage().instance().set(&DataKey::SnapshotNonce(grant_id), &nonce);
-}
+        // Check 24-hour limit
+        let now = env.ledger().timestamp();
+        if now >= grant.last_withdrawal_timestamp + 86400 {
+            grant.withdrawal_amount_today = 0;
+            grant.last_withdrawal_timestamp = now;
+        }
 
-fn read_financial_snapshot(env: &Env, grant_id: u64, timestamp: u64) -> Result<FinancialSnapshot, Error> {
-    env.storage()
-        .instance()
-        .get(&DataKey::FinancialSnapshot(grant_id, timestamp))
-        .ok_or(Error::SnapshotNotFound)
-}
+        if grant.withdrawal_amount_today + amount > grant.max_withdrawal_per_day {
+            return Err(Error::WithdrawalLimitExceeded);
+        }
 
-fn write_financial_snapshot(env: &Env, grant_id: u64, timestamp: u64, snapshot: &FinancialSnapshot) {
-    env.storage().instance().set(&DataKey::FinancialSnapshot(grant_id, timestamp), snapshot);
-}
+        // Logic for transfer...
+        grant.claimable -= amount;
+        grant.withdrawn += amount;
+        grant.withdrawal_amount_today += amount;
 
-fn generate_snapshot_hash(
-    grant_id: u64,
-    total_received: i128,
-    timestamp: u64,
-    expiry: u64,
-    version: u32,
-) -> [u8; 32] {
-    // Create a deterministic hash from snapshot data
-    // In a real implementation, this would use SHA-256 or similar
-    let mut hasher = [0u8; 32];
-    
-    // Simple hash implementation for demonstration
-    // In production, use proper cryptographic hash
-    let combined = format!(
-        "{}:{}:{}:{}:{}",
-        grant_id, total_received, timestamp, expiry, version
-    );
-    
-    // For now, return a placeholder hash
-    // TODO: Implement proper SHA-256 hashing
-    for i in 0..32.min(combined.len()) {
-        hasher[i] = combined.as_bytes()[i];
+        let token_client = token::Client::new(&env, &grant.token_address);
+        token_client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
+
+        write_grant(&env, grant_id, &grant);
+        Ok(())
     }
-    
-    hasher
 }
 
-fn generate_contract_signature(
-    env: &Env,
-    grant_id: u64,
-    total_received: i128,
-    timestamp: u64,
-) -> [u8; 64] {
-    // Generate a contract signature for the snapshot
-    // In a real implementation, this would use the contract's private key
-    // For now, return a deterministic signature based on the data
-    let mut signature = [0u8; 64];
-    
-    let combined = format!("{}:{}:{}", grant_id, total_received, timestamp);
-    
-    // Simple signature generation for demonstration
-    // In production, use proper cryptographic signing
-    for i in 0..64.min(combined.len()) {
-        signature[i] = combined.as_bytes()[i];
-    }
-    
-    signature
-}
-
-// Slashing Proposal Helper Functions
-fn read_next_proposal_id(env: &Env) -> u64 {
-    env.storage()
-        .instance()
-        .get(&DataKey::NextProposalId)
-        .unwrap_or(1)
-}
+// --- Helpers ---
 
 fn write_next_proposal_id(env: &Env, proposal_id: u64) {
     env.storage().instance().set(&DataKey::NextProposalId, &proposal_id);
@@ -1247,6 +1163,71 @@ fn calculate_voting_results(env: &Env, proposal: &SlashingProposal) -> (bool, bo
     };
     
     (participation_met, approval_met)
+}
+
+// --- Temporal Guard Helper Functions (Task #183) ---
+
+fn get_temporal_guard_contract(env: &Env) -> Result<Address, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::TemporalGuardContract)
+        .ok_or(Error::NotInitialized)
+}
+
+fn set_temporal_guard_contract(env: &Env, address: &Address) {
+    env.storage().instance().set(&DataKey::TemporalGuardContract, address);
+}
+
+fn check_withdrawal_temporal_guard(env: &Env, recipient: &Address, grant_id: u64) -> Result<(), Error> {
+    let temporal_guard = get_temporal_guard_contract(env)?;
+    
+    // Create a client for the temporal guard contract
+    let guard_client = crate::temporal_guard::TemporalGuardContractClient::new(env, &temporal_guard);
+    
+    // Check if withdrawal is allowed
+    guard_client.check_withdraw_allowed(&recipient.clone(), &grant_id)
+        .map_err(|_| Error::TemporalGuardViolation)?;
+    
+    Ok(())
+}
+
+fn record_withdrawal_temporal_guard(env: &Env, recipient: &Address, grant_id: u64) -> Result<(), Error> {
+    let temporal_guard = get_temporal_guard_contract(env)?;
+    
+    // Create a client for the temporal guard contract
+    let guard_client = crate::temporal_guard::TemporalGuardContractClient::new(env, &temporal_guard);
+    
+    // Record the successful withdrawal
+    guard_client.record_withdrawal(&recipient.clone(), &grant_id)
+        .map_err(|_| Error::TemporalGuardViolation)?;
+    
+    Ok(())
+}
+
+fn check_vote_temporal_guard(env: &Env, voter: &Address, proposal_id: u64) -> Result<(), Error> {
+    let temporal_guard = get_temporal_guard_contract(env)?;
+    
+    // Create a client for the temporal guard contract
+    let guard_client = crate::temporal_guard::TemporalGuardContractClient::new(env, &temporal_guard);
+    
+    // Check if voting is allowed
+    guard_client.check_vote_allowed(&voter.clone(), &proposal_id)
+        .map_err(|_| Error::TemporalGuardViolation)?;
+    
+    Ok(())
+}
+
+fn record_vote_temporal_guard(env: &Env, voter: &Address, proposal_id: u64) -> Result<(), Error> {
+    let temporal_guard = get_temporal_guard_contract(env)?;
+    
+    // Create a client for the temporal guard contract
+    let guard_client = crate::temporal_guard::TemporalGuardContractClient::new(env, &temporal_guard);
+    
+    // Record the successful vote
+    guard_client.record_vote(&voter.clone(), &proposal_id)
+        .map_err(|_| Error::TemporalGuardViolation)?;
+    
+    Ok(())
 }
 
 // --- Milestone System Helper Functions ---
@@ -1572,6 +1553,21 @@ impl GrantContract {
         Ok(())
     }
 
+    /// Task #183: Set the Temporal Guard contract address (admin only)
+    /// This enables flash loan protection for voting and withdrawal operations
+    pub fn set_temporal_guard_contract(env: Env, admin: Address, temporal_guard_contract: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        env.storage().instance().set(&DataKey::TemporalGuardContract, &temporal_guard_contract);
+        
+        env.events().publish(
+            (symbol_short!("temp_guard_contract_set"),),
+            (admin, temporal_guard_contract),
+        );
+        
+        Ok(())
+    }
+
     /// Task #192: Batch Refund for Failed Grant Rounds
     /// Atomic refund for failed Gitcoin-style rounds. Optimized iterate-and-transfer.
     pub fn batch_refund(env: Env, grant_id: u64) -> Result<(), Error> {
@@ -1582,32 +1578,22 @@ impl GrantContract {
             return Err(Error::InvalidState); 
         }
 
-        let donors: Vec<Address> = env.storage().instance().get(&DataKey::GrantDonors(grant_id)).unwrap_or_else(|| Vec::new(&env));
-        let token_client = token::Client::new(&env, &grant.token_address);
-        let mut total_refunded = 0i128;
-
-        for donor in donors.iter() {
-            let key = DataKey::DonorRecord(grant_id, donor.clone());
-            let amount: i128 = env.storage().instance().get(&key).unwrap_or(0);
-            if amount > 0 {
-                token_client.transfer(&env.current_contract_address(), &donor, &amount);
-                env.storage().instance().remove(&key);
-                total_refunded += amount;
-            }
+        if stream_duration == 0 {
+            panic_with_error!(&env, GrantError::InvalidStreamConfig);
         }
-        
-        env.storage().instance().remove(&DataKey::GrantDonors(grant_id));
-        
-        env.events().publish(
-            (symbol_short!("bat_ref"), grant_id),
-            (donors.len(), total_refunded),
-        );
-        
-        Ok(())
+
+        grant.stream_start = stream_start;
+        grant.stream_duration = stream_duration;
+        env.storage()
+            .instance()
+            .set(&DataKey::Grant(grant_id), &grant);
     }
 
     /// Task #193: Grantee Withdrawal Limit Cooldown Logic
     /// Enforces a daily withdrawal cap to prevent unauthorized rapidly draining.
+    /// 
+    /// Enhanced with Task #183: Cross-Contract Flash Loan Protection
+    /// Prevents voting and withdrawal in the same ledger to stop atomic exploits.
     pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
         let mut grant = read_grant(&env, grant_id)?;
         grant.recipient.require_auth();
@@ -1615,6 +1601,9 @@ impl GrantContract {
         if grant.status != GrantStatus::Active {
             return Err(Error::InvalidState);
         }
+
+        // Task #183: Check temporal guard protection before withdrawal
+        check_withdrawal_temporal_guard(&env, &grant.recipient, grant_id)?;
 
         // Settle accruals
         // settle_grant_internal_logic_call(&mut grant, env.ledger().timestamp())?;
@@ -1643,6 +1632,9 @@ impl GrantContract {
         token_client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
 
         write_grant(&env, grant_id, &grant);
+
+        // Task #183: Record successful withdrawal in temporal guard
+        record_withdrawal_temporal_guard(&env, &grant.recipient, grant_id)?;
 
         env.events().publish(
             (symbol_short!("withdraw"), grant_id),
@@ -1731,9 +1723,11 @@ impl GrantContract {
         total_amount: i128,
         flow_rate: i128,
         warmup_duration: u64,
-
+        priority_level: u32,
+        security_deposit_percentage: u32,
     ) -> Result<(), Error> {
         require_admin_auth(&env)?;
+        Self::check_protocol_not_paused(&env);
 
         if total_amount <= 0 || flow_rate < 0 {
             return Err(Error::InvalidAmount);
@@ -1826,6 +1820,7 @@ impl GrantContract {
         starting_grant_id: u64,
     ) -> Result<BatchInitResult, Error> {
         require_admin_auth(&env)?;
+        Self::check_protocol_not_paused(&env);
 
     pub fn configure_milestone_acceleration(
         env: Env,
@@ -2016,6 +2011,13 @@ impl GrantContract {
             }
         }
 
+        Self::check_protocol_not_paused(&env);
+
+        // Check if grant is in dispute/arbitration
+        if matches!(grant.status, GrantStatus::DisputeRaised | GrantStatus::ArbitrationPending | GrantStatus::ArbitrationResolved) {
+            return Err(Error::InvalidState);
+        }
+
         // WASM Hash Verification Hook - Ensure user is interacting with the correct contract version
         let current_wasm_hash = env.current_contract_address().contract_id();
         let verification_result = WasmHashVerification::verify_grant_wasm_hash(
@@ -2099,8 +2101,14 @@ impl GrantContract {
 
     pub fn withdraw(env: Env, grant_id: Symbol, caller: Address) -> u128 {
         caller.require_auth();
+        Self::check_protocol_not_paused(&env);
 
         let grant = Self::load_grant(&env, &grant_id);
+
+        // Check if grant is in dispute/arbitration
+        if matches!(grant.status, GrantStatus::DisputeRaised | GrantStatus::ArbitrationPending | GrantStatus::ArbitrationResolved) {
+            panic_with_error!(&env, GrantError::InvalidStatus);
+        }
         let share = match grant.grantees.get(caller.clone()) {
             Some(share) => share,
             None => panic_with_error!(&env, GrantError::InvalidGrantee),
@@ -2148,6 +2156,9 @@ impl GrantContract {
         grant.last_claim_time = env.ledger().timestamp();
 
         write_grant(&env, grant_id, &grant);
+
+        // Invalidate balance cache after withdrawal
+        Self::invalidate_balance_cache(&env, grant_id);
 
         let token_addr = read_grant_token(&env)?;
         let client = token::Client::new(&env, &token_addr);
@@ -3459,6 +3470,12 @@ pub mod grant {
         let mut grant = read_grant(&env, grant_id)?;
         let validator_addr = grant.validator.clone().ok_or(Error::InvalidState)?;
         validator_addr.require_auth();
+        Self::check_protocol_not_paused(&env);
+
+        // Check if grant is in dispute/arbitration
+        if matches!(grant.status, GrantStatus::DisputeRaised | GrantStatus::ArbitrationPending | GrantStatus::ArbitrationResolved) {
+            return Err(Error::InvalidState);
+        }
 
         if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
             return Err(Error::InvalidState);
@@ -3478,6 +3495,9 @@ pub mod grant {
             .ok_or(Error::MathOverflow)?;
 
         write_grant(&env, grant_id, &grant);
+
+        // Invalidate balance cache after validator withdrawal
+        Self::invalidate_balance_cache(&env, grant_id);
 
         let token_addr = read_grant_token(&env)?;
         let client = token::Client::new(&env, &token_addr);
@@ -3858,8 +3878,11 @@ pub mod grant {
             return Err(Error::StakeAlreadyDeposited);
         }
 
-        // Validate stake amount
-        if amount != PROPOSAL_STAKE_AMOUNT {
+        // Calculate reputation-based discount
+        let required_amount = calculate_reputation_stake_discount(&env, &staker, PROPOSAL_STAKE_AMOUNT)?;
+
+        // Validate stake amount (must be at least the discounted amount)
+        if amount < required_amount {
             return Err(Error::InvalidStakeAmount);
         }
 
@@ -3890,10 +3913,10 @@ pub mod grant {
         let current_balance = read_stake_escrow_balance(&env);
         write_stake_escrow_balance(&env, current_balance + amount);
 
-        // Publish stake deposit event
+        // Publish stake deposit event with reputation discount info
         env.events().publish(
             (Symbol::new(&env, "proposal_stake_deposited"), grant_id),
-            (staker, amount, now),
+            (staker, amount, required_amount, now),
         );
 
         Ok(())
@@ -4095,962 +4118,19 @@ pub mod grant {
         }
     }
 
-    // --- Cross-Chain Metadata Functions ---
 
-    /// Create or update cross-chain metadata for a grant
-    /// 
-    /// This function allows grant creators to establish cross-chain visibility
-    /// by creating standardized JSON-LD metadata that can be indexed by other chains.
-    /// 
-    /// # Arguments
-    /// * `grant_id` - The Stellar grant ID
-    /// * `metadata_hash` - SHA-256 hash of the JSON-LD metadata
-    /// * `ipfs_cid` - IPFS CID where full metadata is stored
-    /// * `schema_type` - Type of schema (Grant, Project, etc.)
-    /// * `public` - Whether metadata should be publicly visible
-    pub fn create_cross_chain_metadata(
-        env: Env,
-        grant_id: u64,
-        metadata_hash: [u8; 32],
-        ipfs_cid: String,
-        schema_type: String,
-        public: bool,
-    ) -> Result<(), Error> {
-        // Verify the caller is the grant recipient or admin
-        let grant = read_grant(&env, grant_id)?;
-        let caller = env.current_contract_address();
-        
-        // Only grant recipient or admin can create metadata
-        if caller != grant.recipient {
-            require_admin_auth(&env)?;
-        }
-
-        // Create metadata through cross-chain module
-        CrossChainMetadata::create_grant_metadata(
-            env,
-            grant_id,
-            metadata_hash,
-            ipfs_cid,
-            schema_type,
-            grant.recipient,
-            public,
-        ).map_err(|e| Error::Custom(2000 + e as u32))
-    }
-
-    /// Add cross-chain reference to link with grants on other chains
-    /// 
-    /// This enables matching funds programs and cross-chain grant platforms
-    /// to discover and verify Stellar grants.
-    /// 
-    /// # Arguments
-    /// * `grant_id` - The Stellar grant ID
-    /// * `chain_id` - Target chain identifier (ethereum, polygon, etc.)
-    /// * `external_id` - Grant/contract ID on target chain
-    /// * `reference_type` - Type of reference (Contract, Transaction, etc.)
-    pub fn add_cross_chain_reference(
-        env: Env,
-        grant_id: u64,
-        chain_id: String,
-        external_id: String,
-        reference_type: u32, // 0=Contract, 1=Transaction, 2=Proposal, 3=Project, 4=Custom
-    ) -> Result<(), Error> {
-        // Verify the caller is the grant recipient or admin
-        let grant = read_grant(&env, grant_id)?;
-        let caller = env.current_contract_address();
-        
-        // Only grant recipient or admin can add references
-        if caller != grant.recipient {
-            require_admin_auth(&env)?;
-        }
-
-        // Convert reference_type to enum
-        let ref_type = match reference_type {
-            0 => crate::cross_chain_metadata::ReferenceType::Contract,
-            1 => crate::cross_chain_metadata::ReferenceType::Transaction,
-            2 => crate::cross_chain_metadata::ReferenceType::Proposal,
-            3 => crate::cross_chain_metadata::ReferenceType::Project,
-            4 => crate::cross_chain_metadata::ReferenceType::Custom,
-            _ => return Err(Error::InvalidAmount), // Reuse error for invalid type
-        };
-
-        CrossChainMetadata::add_cross_chain_reference(
-            env,
-            grant_id,
-            chain_id,
-            external_id,
-            ref_type,
-            grant.recipient,
-        ).map_err(|e| Error::Custom(2000 + e as u32))
-    }
-
-    /// Get cross-chain metadata for a grant
-    /// 
-    /// This function allows anyone to retrieve the standardized metadata
-    /// for cross-chain indexing and visibility.
-    /// 
-    /// # Arguments
-    /// * `grant_id` - The Stellar grant ID
-    /// 
-    /// # Returns
-    /// * `GrantMetadata` - The cross-chain metadata
-    pub fn get_cross_chain_metadata(env: Env, grant_id: u64) -> Result<crate::cross_chain_metadata::GrantMetadata, Error> {
-        CrossChainMetadata::get_grant_metadata(env, grant_id)
-            .map_err(|e| Error::Custom(2000 + e as u32))
-    }
-
-    /// Get all cross-chain references for a grant
-    /// 
-    /// # Arguments
-    /// * `grant_id` - The Stellar grant ID
-    /// 
-    /// # Returns
-    /// * `Vec<CrossChainReference>` - All cross-chain references
-    pub fn get_cross_chain_references(env: Env, grant_id: u64) -> Result<Vec<crate::cross_chain_metadata::CrossChainReference>, Error> {
-        CrossChainMetadata::get_cross_chain_references(env, grant_id)
-            .map_err(|e| Error::Custom(2000 + e as u32))
-    }
-
-    /// Search grants by chain for cross-chain discovery
-    /// 
-    /// This function enables external chains and indexing services
-    /// to discover Stellar grants that have references to their chain.
-    /// 
-    /// # Arguments
-    /// * `chain_id` - Chain identifier to search for
-    /// 
-    /// # Returns
-    /// * `Vec<u64>` - List of Stellar grant IDs with references to this chain
-    pub fn get_grants_by_chain(env: Env, chain_id: String) -> Vec<u64> {
-        CrossChainMetadata::get_grants_by_chain(env, chain_id)
-    }
-
-    /// Search metadata with filters for cross-chain indexing
-    /// 
-    /// # Arguments
-    /// * `schema_type` - Filter by schema type (optional)
-    /// * `verified_only` - Only return verified metadata
-    /// * `public_only` - Only return public metadata
-    /// * `limit` - Maximum results to return
-    /// 
-    /// # Returns
-    /// * `Vec<GrantMetadata>` - Matching metadata
-    pub fn search_cross_chain_metadata(
-        env: Env,
-        schema_type: Option<String>,
-        verified_only: bool,
-        public_only: bool,
-        limit: u32,
-    ) -> Vec<crate::cross_chain_metadata::GrantMetadata> {
-        CrossChainMetadata::search_metadata(env, schema_type, verified_only, public_only, limit)
-    }
-
-    /// Get global metadata statistics for cross-chain analytics
-    /// 
-    /// # Returns
-    /// * (total_grants, verified_grants, public_grants, total_chains)
-    pub fn get_cross_chain_statistics(env: Env) -> (u64, u64, u64, u64) {
-        CrossChainMetadata::get_metadata_statistics(env)
-    }
-
-    /// Verify cross-chain reference (trusted verifiers only)
-    /// 
-    /// This function should be called by trusted oracles or verification services
-    /// to confirm the validity of cross-chain references.
-    /// 
-    /// # Arguments
-    /// * `grant_id` - The Stellar grant ID
-    /// * `chain_id` - Chain identifier
-    /// * `external_id` - External grant ID
-    /// * `verified` - Whether the reference is verified
-    pub fn verify_cross_chain_reference(
-        env: Env,
-        grant_id: u64,
-        chain_id: String,
-        external_id: String,
-        verified: bool,
-    ) -> Result<(), Error> {
-        // Only admin can verify references
-        require_admin_auth(&env)?;
-
-        CrossChainMetadata::verify_cross_chain_reference(
-            env,
-            grant_id,
-            chain_id,
-            external_id,
-            env.current_contract_address(),
-            verified,
-        ).map_err(|e| Error::Custom(2000 + e as u32))
-    }
-
-    // --- Self-Destruct Functions ---
-
-    /// Automatically self-destruct the contract when all grants are completed
-    /// 
-    /// This function implements "Ecosystem Hygiene" by cleaning up the contract
-    /// and returning the base reserve XLM to the DAO treasury.
-    /// 
-    /// # Requirements
-    /// - All grants must be in completed, cancelled, or self-terminated state
-    /// - All balances must be zero (no claimable or withdrawn amounts)
-    /// - Only admin can call this function
-    /// 
-    /// # Returns
-    /// - `Ok(())` if self-destruct was successful
-    /// - `Error::GrantsNotCompleted` if any grants are still active/paused
-    /// - `Error::BalancesNotZero` if any balances remain
-    pub fn self_destruct(env: Env) -> Result<(), Error> {
-        // Require admin authentication
-        require_admin_auth(&env)?;
-        
-        // Check if all grants are completed
-        let grant_ids = read_grant_ids(&env);
-        for grant_id in grant_ids.iter() {
-            let grant = read_grant(&env, grant_id)?;
-            
-            // Grant must be completed, cancelled, or self-terminated
-            if grant.status != GrantStatus::Completed && 
-               grant.status != GrantStatus::Cancelled &&
-               grant.status != GrantStatus::RageQuitted {
-                return Err(Error::GrantsNotCompleted);
-            }
-            
-            // Check if grant has any remaining balances
-            if grant.claimable > 0 || grant.withdrawn > 0 {
-                return Err(Error::BalancesNotZero);
-            }
-        }
-        
-        // Get treasury address to return base reserve
-        let treasury = read_treasury(&env)?;
-        
-        // Get contract's native XLM balance
-        let native_token = read_native_token(&env)?;
-        let token_client = token::Client::new(&env, &native_token);
-        let contract_balance = token_client.balance(&env.current_contract_address());
-        
-        // Transfer all remaining XLM to treasury
-        if contract_balance > 0 {
-            token_client.transfer(
-                &env.current_contract_address(),
-                &treasury,
-                &contract_balance,
-            );
-        }
-        
-        // Emit self-destruct event
-        env.events().publish(
-            (symbol_short!("destruct"),),
-            (
-                env.current_contract_address(),
-                treasury,
-                contract_balance,
-                env.ledger().timestamp(),
-            ),
-        );
-        
-        // Delete all storage
-        env.storage().instance().clear();
-        
-        // Delete the contract instance
-        env.deployer().delete_contract(env.current_contract_address());
-        
-        Ok(())
-    }
-
-    /// Check if contract can be self-destructed
-    /// 
-    /// This function checks the conditions required for self-destruction
-    /// without actually performing the operation.
-    /// 
-    /// # Returns
-    /// - `Ok(true)` if all conditions are met
-    /// - `Ok(false)` if conditions are not met
-    /// - `Error` if there's an issue checking conditions
-    pub fn can_self_destruct(env: Env) -> Result<bool, Error> {
-        // Check if all grants are completed
-        let grant_ids = read_grant_ids(&env);
-        for grant_id in grant_ids.iter() {
-            let grant = read_grant(&env, grant_id)?;
-            
-            // Grant must be completed, cancelled, or self-terminated
-            if grant.status != GrantStatus::Completed && 
-               grant.status != GrantStatus::Cancelled &&
-               grant.status != GrantStatus::RageQuitted {
-                return Ok(false);
-            }
-            
-            // Check if grant has any remaining balances
-            if grant.claimable > 0 || grant.withdrawn > 0 {
-                return Ok(false);
-            }
-        }
-        
-        Ok(true)
-    // ============================================================
-    // TASK 1: WITHDRAW ALL - Multi-Grant Batch Withdrawal
-    // ============================================================
-    
-    /// Withdraw earned balance from multiple grants in a single transaction
-    /// 
-    /// This function enables "Super-Builders" with multiple active grants to withdraw
-    /// from all streams at once, saving ~80% on gas fees compared to individual withdrawals.
-    /// Implements clawback buffer (Task 3) for security against flash exploits.
-    /// 
-    /// # Arguments
-    /// * `grant_ids` - Vector of grant IDs to withdraw from
-    /// * `amounts` - Vector of amounts to withdraw (must match grant_ids length)
-    /// 
-    /// # Returns
-    /// * `WithdrawAllResult` - Detailed results including processed grants and amounts
-    pub fn withdraw_all(
-        env: Env,
-        grant_ids: Vec<u64>,
-        amounts: Vec<i128>,
-    ) -> Result<WithdrawAllResult, Error> {
-        if grant_ids.len() != amounts.len() || grant_ids.is_empty() {
-            return Err(Error::InvalidAmount);
-        }
-
-        let caller = env.current_contract_address();
-        let mut total_buffered = 0i128;
-        let mut total_released = 0i128;
-        let mut successful_grants = Vec::<u64>::new(&env);
-        let mut failed_grants = Vec::<u64>::new(&env);
-
-        for i in 0..grant_ids.len() {
-            let grant_id = grant_ids.get(i).unwrap();
-            let amount = amounts.get(i).unwrap();
-
-            // Attempt withdrawal for this grant
-            match Self::process_single_withdrawal(&env, grant_id, amount, &caller) {
-                Ok(buffered_amount) => {
-                    successful_grants.push_back(grant_id);
-                    total_buffered += buffered_amount;
-                }
-                Err(_) => {
-                    failed_grants.push_back(grant_id);
-                }
-            }
-        }
-
-        // If clawback is disabled (admin setting), release immediately
-        let clawback_enabled = env.storage().instance()
-            .get(&DataKey::ClawbackWindow(0))
-            .unwrap_or(true);
-
-        if !clawback_enabled {
-            total_released = total_buffered;
-            total_buffered = 0;
-        }
-
-        Ok(WithdrawAllResult {
-            total_withdrawn: total_buffered + total_released,
-            grants_processed: successful_grants,
-            failed_grants,
-            buffered_amount: total_buffered,
-            released_amount: total_released,
-        })
-    }
-
-    /// Process withdrawal for a single grant within withdraw_all
-    fn process_single_withdrawal(
-        env: &Env,
-        grant_id: u64,
-        amount: i128,
-        caller: &Address,
-    ) -> Result<i128, Error> {
-        let mut grant = read_grant(env, grant_id)?;
-        
-        // Authenticate based on grant type
-        match grant.stream_type {
-            StreamType::TimeLockedLease => grant.lessor.require_auth(),
-            _ => grant.recipient.require_auth(),
-        }
-
-        // Settle grant to get current claimable amount
-        settle_grant(env, &mut grant, env.ledger().timestamp())?;
-
-        if amount > grant.claimable || amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        // Update grant state
-        grant.claimable -= amount;
-        grant.withdrawn += amount;
-        grant.last_claim_time = env.ledger().timestamp();
-        write_grant(env, grant_id, &grant);
-
-        // Record clawback window
-        let now = env.ledger().timestamp();
-        let clawback_deadline = now + CLAWBACK_WINDOW_SECS;
-        env.storage().instance().set(
-            &DataKey::ClawbackWindow(grant_id),
-            &clawback_deadline,
-        );
-
-        // Store in withdrawal buffer (frozen during clawback window)
-        let buffer_key = DataKey::WithdrawalBuffer(grant_id, grant.recipient.clone());
-        let current_buffer = env.storage().instance().get::<_, i128>(&buffer_key).unwrap_or(0);
-        env.storage().instance().set(&buffer_key, &(current_buffer + amount));
-
-        // Transfer tokens from contract to buffer
-        let token_addr = read_grant_token(env)?;
-        let client = token::Client::new(env, &token_addr);
-        client.transfer(&env.current_contract_address(), &env.current_contract_address(), &amount);
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("withdraw_buf"), symbol_short!("gnt")),
-            (grant_id, caller, amount, clawback_deadline),
-        );
-
-        Ok(amount)
-    }
-
-    /// Release buffered funds after clawback window expires
-    pub fn release_buffered_funds(env: Env, grant_id: u64, recipient: Address) -> Result<i128, Error> {
-        recipient.require_auth();
-
-        let clawback_deadline = env.storage().instance()
-            .get(&DataKey::ClawbackWindow(grant_id))
-            .ok_or(Error::ClawbackExpired)?;
-
-        if env.ledger().timestamp() < clawback_deadline {
-            return Err(Error::ClawbackWindowActive);
-        }
-
-        let buffer_key = DataKey::WithdrawalBuffer(grant_id, recipient.clone());
-        let buffered_amount = env.storage().instance()
-            .get::<_, i128>(&buffer_key)
-            .ok_or(Error::WithdrawalBuffered)?;
-
-        if buffered_amount == 0 {
-            return Err(Error::InvalidWithdrawalAmount);
-        }
-
-        // Clear buffer
-        env.storage().instance().set(&buffer_key, &0i128);
-
-        // Transfer from buffer to recipient's main wallet
-        let token_addr = read_grant_token(env)?;
-        let client = token::Client::new(env, &token_addr);
-        client.transfer(&env.current_contract_address(), &recipient, &buffered_amount);
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("buf_rel"), symbol_short!("gnt")),
-            (grant_id, recipient, buffered_amount),
-        );
-
-        Ok(buffered_amount)
-    }
-
-    // ============================================================
-    // TASK 2: FINANCIAL STATEMENT - Certified Tax Compliance Record
-    // ============================================================
-    
-    /// Generate a certified financial statement hash for tax compliance
-    /// 
-    /// Returns a signed "Financial Statement" hash that can be provided to tax auditors.
-    /// The hash includes GrantID, TotalEarned, Timestamp, and is verifiable against
-    /// the public Stellar ledger. This "Compliance-as-Code" feature makes Grant-Stream
-    /// tax-friendly for professional builders and non-profits worldwide.
-    /// 
-    /// # Arguments
-    /// * `grant_id` - The grant ID to generate statement for
-    /// * `recipient` - The recipient address (for verification)
-    /// 
-    /// # Returns
-    /// * `FinancialStatement` - Complete statement with cryptographic proof
-    pub fn get_financial_statement(
-        env: Env,
-        grant_id: u64,
-        recipient: Address,
-    ) -> Result<FinancialStatement, Error> {
-        recipient.require_auth();
-
-        let grant = read_grant(&env, grant_id)?;
-        
-        if grant.recipient != recipient {
-            return Err(Error::Unauthorized);
-        }
-
-        // Settle grant to get latest claimable amount
-        let mut mutable_grant = grant.clone();
-        settle_grant(&env, &mut mutable_grant, env.ledger().timestamp())?;
-
-        let total_earned = mutable_grant.withdrawn + mutable_grant.claimable;
-        let timestamp = env.ledger().timestamp();
-
-        // Get or create nonce for uniqueness
-        let nonce_key = DataKey::FinancialStatementNonce(grant_id);
-        let mut nonce = env.storage().instance().get::<_, u64>(&nonce_key).unwrap_or(0);
-        nonce += 1;
-        env.storage().instance().set(&nonce_key, &nonce);
-
-        // Generate statement hash
-        let statement_hash = Self::generate_financial_statement_hash(
-            &env,
-            grant_id,
-            &recipient,
-            total_earned,
-            mutable_grant.withdrawn,
-            timestamp,
-            nonce,
-        );
-
-        // Generate contract signature
-        let contract_signature = Self::generate_contract_signature_for_statement(
-            &env,
-            grant_id,
-            total_earned,
-            timestamp,
-        );
-
-        let statement = FinancialStatement {
-            grant_id,
-            recipient: recipient.clone(),
-            total_earned,
-            total_withdrawn: mutable_grant.withdrawn,
-            statement_timestamp: timestamp,
-            statement_hash,
-            contract_signature,
-            version: FINANCIAL_STATEMENT_VERSION,
-        };
-
-        // Store snapshot for audit trail
-        write_financial_snapshot(
-            &env,
-            grant_id,
-            timestamp,
-            &FinancialSnapshot {
-                grant_id,
-                total_received: total_earned,
-                timestamp,
-                expiry: timestamp + SNAPSHOT_EXPIRY,
-                version: SNAPSHOT_VERSION,
-                contract_signature,
-                hash: statement_hash,
-            },
-        )?;
-
-        // Emit event for off-chain indexing
-        env.events().publish(
-            (symbol_short!("fin_stmt"), symbol_short!("gnt")),
-            (grant_id, recipient, total_earned, timestamp, statement_hash),
-        );
-
-        Ok(statement)
-    }
-
-    /// Generate deterministic hash for financial statement
-    fn generate_financial_statement_hash(
-        env: &Env,
-        grant_id: u64,
-        recipient: &Address,
-        total_earned: i128,
-        total_withdrawn: i128,
-        timestamp: u64,
-        nonce: u64,
-    ) -> [u8; 32] {
-        let mut hasher = [0u8; 32];
-        
-        let combined = format!(
-            "{}:{}:{}:{}:{}:{}:{}",
-            grant_id,
-            recipient,
-            total_earned,
-            total_withdrawn,
-            timestamp,
-            nonce,
-            FINANCIAL_STATEMENT_VERSION
-        );
-        
-        for i in 0..32.min(combined.len()) {
-            hasher[i] = combined.as_bytes()[i];
-        }
-        
-        hasher
-    }
-
-    /// Generate contract signature for financial statement
-    fn generate_contract_signature_for_statement(
-        env: &Env,
-        grant_id: u64,
-        total_earned: i128,
-        timestamp: u64,
-    ) -> [u8; 64] {
-        let mut signature = [0u8; 64];
-        
-        let combined = format!("statement:{}:{}:{}", grant_id, total_earned, timestamp);
-        
-        for i in 0..64.min(combined.len()) {
-            signature[i] = combined.as_bytes()[i];
-        }
-        
-        signature
-    }
-
-    // ============================================================
-    // TASK 3: CLAWBACK WINDOW - Fraud Protection Mechanism
-    // ============================================================
-    
-    /// Execute clawback reversal of fraudulent withdrawal (DAO only)
-    /// 
-    /// Within 4 hours of withdrawal, the DAO can reverse a withdrawal if a
-    /// fraud alert is raised. Funds are held in a temporary buffer before
-    /// release, providing last-line-of-defense against flash exploits.
-    /// 
-    /// # Arguments
-    /// * `grant_id` - Grant ID to execute clawback on
-    /// * `reason` - Reason for clawback (fraud alert description)
-    /// 
-    /// # Returns
-    /// * `i128` - Amount clawed back
-    pub fn execute_clawback(
-        env: Env,
-        grant_id: u64,
-        reason: String,
-    ) -> Result<i128, Error> {
-        // Only admin/DAO can execute clawback
-        require_admin_auth(&env)?;
-
-        if reason.len() > MAX_SLASHING_REASON_LENGTH as usize {
-            return Err(Error::InvalidReasonLength);
-        }
-
-        let clawback_deadline = env.storage().instance()
-            .get(&DataKey::ClawbackWindow(grant_id))
-            .ok_or(Error::ClawbackExpired)?;
-
-        if env.ledger().timestamp() > clawback_deadline {
-            return Err(Error::ClawbackExpired);
-        }
-
-        let grant = read_grant(&env, grant_id)?;
-        
-        let buffer_key = DataKey::WithdrawalBuffer(grant_id, grant.recipient.clone());
-        let buffered_amount = env.storage().instance()
-            .get::<_, i128>(&buffer_key)
-            .ok_or(Error::WithdrawalBuffered)?;
-
-        if buffered_amount == 0 {
-            return Err(Error::FundsAlreadyReleased);
-        }
-
-        // Clear buffer
-        env.storage().instance().set(&buffer_key, &0i128);
-
-        // Return funds to treasury instead of releasing to recipient
-        let treasury = read_treasury(&env)?;
-        let token_addr = read_grant_token(&env)?;
-        let client = token::Client::new(&env, &token_addr);
-        client.transfer(&env.current_contract_address(), &treasury, &buffered_amount);
-
-        // Mark clawback in record
-        let clawback_record = ClawbackRecord {
-            grant_id,
-            recipient: grant.recipient.clone(),
-            withdrawal_amount: buffered_amount,
-            withdrawal_timestamp: env.ledger().timestamp(),
-            clawback_deadline,
-            is_frozen: false,
-            is_released: false,
-            clawback_reason: Some(reason.clone()),
-        };
-
-        // Store clawback record for audit
-        env.storage().instance().set(
-            &DataKey::WithdrawalBuffer(grant_id, grant.recipient.clone()),
-            &clawback_record,
-        );
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("clawback"), symbol_short!("gnt")),
-            (grant_id, grant.recipient, buffered_amount, reason),
-        );
-
-        Ok(buffered_amount)
-    }
-
-    /// Query clawback status for a grant
-    pub fn get_clawback_status(env: Env, grant_id: u64) -> Result<ClawbackRecord, Error> {
-        let grant = read_grant(&env, grant_id)?;
-        
-        let clawback_deadline = env.storage().instance()
-            .get::<_, u64>(&DataKey::ClawbackWindow(grant_id))
-            .ok_or(Error::ClawbackExpired)?;
-
-        let buffer_key = DataKey::WithdrawalBuffer(grant_id, grant.recipient.clone());
-        let withdrawal_amount = env.storage().instance()
-            .get::<_, i128>(&buffer_key)
-            .unwrap_or(0);
-
-        let now = env.ledger().timestamp();
-        let is_expired = now > clawback_deadline;
-        let is_frozen = !is_expired && withdrawal_amount > 0;
-        let is_released = is_expired && withdrawal_amount == 0;
-
-        Ok(ClawbackRecord {
-            grant_id,
-            recipient: grant.recipient.clone(),
-            withdrawal_amount,
-            withdrawal_timestamp: clawback_deadline.saturating_sub(CLAWBACK_WINDOW_SECS),
-            clawback_deadline,
-            is_frozen,
-            is_released,
-            clawback_reason: None,
-        })
-    }
-
-    // ============================================================
-    // TASK 4: CROSS-ASSET MATCHING - DEX Price Integration
-    // ============================================================
-    
-    /// Initialize matching pool with cross-asset support
-    /// 
-    /// Sets up a matching pool that can hold different assets than the grants
-    /// (e.g., USDC pool matching XLM grants). Includes price buffer for volatility.
-    /// 
-    /// # Arguments
-    /// * `pool_token` - Pool token address (e.g., USDC)
-    /// * `grant_token` - Grant token address (e.g., XLM)
-    /// * `initial_price` - Initial DEX price (pool_token per grant_token)
-    /// * `price_buffer_bps` - Buffer in basis points (e.g., 500 = 5%)
-    pub fn initialize_matching_pool(
-        env: Env,
-        pool_token: Address,
-        grant_token: Address,
-        initial_price: i128,
-        price_buffer_bps: Option<u32>,
-    ) -> Result<(), Error> {
-        require_admin_auth(&env)?;
-
-        if initial_price <= 0 {
-            return Err(Error::InvalidPriceBuffer);
-        }
-
-        let buffer_bps = price_buffer_bps.unwrap_or(DEFAULT_PRICE_BUFFER_BPS);
-        if buffer_bps > MAX_PRICE_DEVIATION_BPS {
-            return Err(Error::PriceVolatilityExceeded);
-        }
-
-        let pool_info = MatchingPoolInfo {
-            pool_token: pool_token.clone(),
-            grant_token: grant_token.clone(),
-            pool_balance: 0,
-            allocated_amount: 0,
-            last_dex_price: initial_price,
-            price_buffer_bps: buffer_bps,
-            last_price_update: env.ledger().timestamp(),
-        };
-
-        env.storage().instance().set(&DataKey::MatchingPool(pool_token.clone()), &pool_info);
-
-        // Store initial price update
-        env.storage().instance().set(
-            &DataKey::DexPriceBuffer,
-            &DexPriceUpdate {
-                pool_token,
-                grant_token,
-                price: initial_price,
-                source: String::from_str(&env, "init"),
-                timestamp: env.ledger().timestamp(),
-                confidence_bps: 10000,
-            },
-        );
-
-        env.events().publish(
-            (symbol_short!("match_pool"), symbol_short!("init")),
-            (pool_token, grant_token, initial_price, buffer_bps),
         );
 
         Ok(())
     }
 
-    /// Update DEX price from oracle (oracle only)
-    /// 
-    /// Called by trusted oracle to update the DEX price used for cross-asset matching.
-    /// Includes validation against price buffers to prevent over-promising.
-    /// 
-    /// # Arguments
-    /// * `pool_token` - Pool token address
-    /// * `grant_token` - Grant token address  
-    /// * `new_price` - New DEX price
-    /// * `source` - Oracle/DEX source identifier
-    /// * `confidence_bps` - Price confidence (10000 = 100%)
-    pub fn update_dex_price(
-        env: Env,
-        pool_token: Address,
-        grant_token: Address,
-        new_price: i128,
-        source: String,
-        confidence_bps: u32,
-    ) -> Result<(), Error> {
-        // Only oracle can update prices
-        let oracle = read_oracle(&env)?;
-        oracle.require_auth();
 
-        if new_price <= 0 {
-            return Err(Error::InvalidPriceBuffer);
-        }
-
-        if confidence_bps > 10000 {
-            return Err(Error::InvalidPriceBuffer);
-        }
-
-        // Get current pool info
-        let mut pool_info = env.storage().instance()
-            .get::<_, MatchingPoolInfo>(&DataKey::MatchingPool(pool_token.clone()))
-            .ok_or(Error::PriceOracleNotFound)?;
-
-        // Validate price deviation with buffer
-        let old_price = pool_info.last_dex_price;
-        let max_deviation = (old_price * pool_info.price_buffer_bps as i128) / 10000;
-        let price_diff = if new_price > old_price {
-            new_price - old_price
-        } else {
-            old_price - new_price
-        };
-
-        if price_diff > max_deviation {
-            return Err(Error::PriceVolatilityExceeded);
-        }
-
-        // Check price expiry
-        let now = env.ledger().timestamp();
-        if now - pool_info.last_price_update > DEX_PRICE_EXPIRY_SECS {
-            // Price expired, allow larger update but emit warning
-            env.logs().add(&"Warning: Price expired, updating with caution");
-        }
-
-        // Update pool info
-        pool_info.last_dex_price = new_price;
-        pool_info.last_price_update = now;
-        env.storage().instance().set(&DataKey::MatchingPool(pool_token.clone()), &pool_info);
-
-        // Store price update record
-        let price_update = DexPriceUpdate {
-            pool_token: pool_token.clone(),
-            grant_token: grant_token.clone(),
-            price: new_price,
-            source: source.clone(),
-            timestamp: now,
-            confidence_bps,
-        };
-        env.storage().instance().set(&DataKey::DexPriceBuffer, &price_update);
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("dex_price"), symbol_short!("upd")),
-            (pool_token, grant_token, new_price, source, confidence_bps),
         );
 
         Ok(())
     }
 
-    /// Calculate fair share of matching pool for a grant
-    /// 
-    /// Queries current DEX price and applies buffer to calculate the fair share
-    /// of the pool that should be allocated to a grant. Ensures solvency by
-    /// never over-promising more than the pool actually holds.
-    /// 
-    /// # Arguments
-    /// * `pool_token` - Pool token address
-    /// * `grant_amount` - Grant amount in grant_token
-    /// 
-    /// # Returns
-    /// * `i128` - Fair share amount in pool_token
-    pub fn calculate_fair_share(
-        env: Env,
-        pool_token: Address,
-        grant_amount: i128,
-    ) -> Result<i128, Error> {
-        if grant_amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
 
-        let pool_info = env.storage().instance()
-            .get::<_, MatchingPoolInfo>(&DataKey::MatchingPool(pool_token.clone()))
-            .ok_or(Error::InsufficientMatchingPool)?;
-
-        // Check price expiry
-        let now = env.ledger().timestamp();
-        if now - pool_info.last_price_update > DEX_PRICE_EXPIRY_SECS {
-            return Err(Error::PriceOracleNotFound);
-        }
-
-        // Calculate base conversion
-        let base_amount = (grant_amount * pool_info.last_dex_price) / SCALING_FACTOR;
-
-        // Apply buffer for safety
-        let buffer_amount = (base_amount * pool_info.price_buffer_bps as i128) / 10000;
-        let fair_share = base_amount + buffer_amount;
-
-        // Verify pool has sufficient balance
-        if pool_info.allocated_amount + fair_share > pool_info.pool_balance {
-            return Err(Error::InsufficientMatchingPool);
-        }
-
-        Ok(fair_share)
-    }
-
-    /// Allocate matching pool funds to a grant
-    /// 
-    /// Allocates funds from the matching pool to a specific grant after
-    /// verifying fair share calculation and pool solvency.
-    /// 
-    /// # Arguments
-    /// * `pool_token` - Pool token address
-    /// * `grant_id` - Grant ID to allocate to
-    /// * `amount` - Amount to allocate in pool_token
-    pub fn allocate_matching_funds(
-        env: Env,
-        pool_token: Address,
-        grant_id: u64,
-        amount: i128,
-    ) -> Result<(), Error> {
-        require_admin_auth(&env)?;
-
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        let mut pool_info = env.storage().instance()
-            .get::<_, MatchingPoolInfo>(&DataKey::MatchingPool(pool_token.clone()))
-            .ok_or(Error::InsufficientMatchingPool)?;
-
-        // Verify pool has sufficient balance
-        if pool_info.allocated_amount + amount > pool_info.pool_balance {
-            return Err(Error::InsufficientMatchingPool);
-        }
-
-        // Update allocation
-        pool_info.allocated_amount += amount;
-        env.storage().instance().set(&DataKey::MatchingPool(pool_token.clone()), &pool_info);
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("match_alloc"), symbol_short!("gnt")),
-            (pool_token, grant_id, amount),
-        );
-
-        Ok(())
-    }
-
-    /// Get current matching pool info
-    pub fn get_matching_pool_info(env: Env, pool_token: Address) -> Result<MatchingPoolInfo, Error> {
-        env.storage().instance()
-            .get(&DataKey::MatchingPool(pool_token))
-            .ok_or(Error::InsufficientMatchingPool)
-    }
-
-    /// Get latest DEX price update
-    pub fn get_latest_dex_price(env: Env) -> Result<DexPriceUpdate, Error> {
-        env.storage().instance()
-            .get(&DataKey::DexPriceBuffer)
-            .ok_or(Error::PriceOracleNotFound)
     }
 }
 
@@ -5063,6 +4143,179 @@ fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i
     );
 }
 
+// --- Amendment Helper Functions ---
+
+fn read_amendment(env: &Env, amendment_id: u64) -> Result<GrantAmendment, Error> {
+    // Read all amendments and find the one with matching ID
+    let amendment_ids = read_amendment_ids(env);
+    for id in amendment_ids.iter() {
+        if let Ok(amendment) = env.storage().instance().get::<DataKey, GrantAmendment>(&DataKey::GrantAmendment(id)) {
+            if amendment.amendment_id == amendment_id {
+                return Ok(amendment);
+            }
+        }
+    }
+    Err(Error::AmendmentNotFound)
+}
+
+fn read_active_amendment(env: &Env, grant_id: u64) -> Result<GrantAmendment, Error> {
+    if let Some(amendment) = env.storage().instance().get::<DataKey, GrantAmendment>(&DataKey::GrantAmendment(grant_id)) {
+        if amendment.status == AmendmentStatus::Proposed {
+            return Ok(amendment);
+        }
+    }
+    Err(Error::AmendmentNotFound)
+}
+
+fn read_amendment_ids(env: &Env) -> Vec<u64> {
+    env.storage().instance()
+        .get(&DataKey::AmendmentIds)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn get_next_amendment_id(env: &Env) -> u64 {
+    let next_id = env.storage().instance()
+        .get(&DataKey::NextAmendmentId)
+        .unwrap_or(1);
+    
+    env.storage().instance().set(&DataKey::NextAmendmentId, &(next_id + 1));
+    
+    next_id
+}
+
+fn get_current_field_value(env: &Env, grant: &Grant, amendment_type: AmendmentType) -> Result<String, Error> {
+    let value = match amendment_type {
+        AmendmentType::FlowRateChange => grant.flow_rate.to_string(),
+        AmendmentType::AmountChange => grant.total_amount.to_string(),
+        AmendmentType::DurationChange => grant.stream_duration.to_string(),
+        AmendmentType::RecipientChange => grant.recipient.to_string(),
+        AmendmentType::TokenChange => grant.token_address.to_string(),
+        AmendmentType::Termination => "active".to_string(),
+    };
+    Ok(String::from_str_slice(env, &value))
+}
+
+fn calculate_vested_amount(env: &Env, grant: &Grant) -> Result<i128, Error> {
+    let current_time = env.ledger().timestamp();
+    
+    if current_time <= grant.cliff_end {
+        return Ok(0);
+    }
+    
+    let elapsed = current_time.saturating_sub(grant.stream_start);
+    let total_duration = grant.stream_duration;
+    
+    if elapsed >= total_duration {
+        return Ok(grant.total_amount);
+    }
+    
+    let vested = (grant.total_amount * elapsed as i128) / total_duration as i128;
+    Ok(vested.min(grant.total_amount))
+}
+
+fn execute_amendment_change(env: &Env, amendment: &GrantAmendment) -> Result<(), Error> {
+    let mut grant = read_grant(env, amendment.grant_id)?;
+    
+    match amendment.amendment_type {
+        AmendmentType::FlowRateChange => {
+            let value_str = amendment.new_value.to_string();
+            let new_flow_rate = value_str.parse::<i128>()
+                .map_err(|_| Error::InvalidAmount)?;
+            grant.flow_rate = new_flow_rate;
+        },
+        AmendmentType::AmountChange => {
+            let value_str = amendment.new_value.to_string();
+            let new_amount = value_str.parse::<i128>()
+                .map_err(|_| Error::InvalidAmount)?;
+            grant.total_amount = new_amount;
+        },
+        AmendmentType::DurationChange => {
+            let value_str = amendment.new_value.to_string();
+            let new_duration = value_str.parse::<u64>()
+                .map_err(|_| Error::InvalidAmount)?;
+            grant.stream_duration = new_duration;
+        },
+        AmendmentType::RecipientChange => {
+            // This would require address parsing
+            // For now, we'll skip this implementation
+            return Err(Error::NotAuthorized);
+        },
+        AmendmentType::TokenChange => {
+            // This would require address parsing
+            // For now, we'll skip this implementation
+            return Err(Error::NotAuthorized);
+        },
+        AmendmentType::Termination => {
+            grant.status = GrantStatus::Cancelled;
+        },
+    }
+    
+    env.storage().instance().set(&DataKey::Grant(amendment.grant_id), &grant);
+    Ok(())
+}
+
+fn create_amendment_appeal(env: &Env, amendment: &GrantAmendment, reason: &str) -> Result<(), Error> {
+    use super::grant_appeals::{AppealStatus, GrantAppeal};
+    
+    let appeal_id = get_next_appeal_id(env);
+    let appeal = GrantAppeal {
+        appeal_id,
+        amendment_id: amendment.amendment_id,
+        appellant: env.current_contract_address(),
+        reason: String::from_str_slice(env, reason),
+        evidence_hash: [0u8; 32], // Default hash for now
+        created_at: env.ledger().timestamp(),
+        voting_deadline: env.ledger().timestamp() + AMENDMENT_CHALLENGE_WINDOW,
+        status: AppealStatus::Proposed,
+        votes_for: 0,
+        votes_against: 0,
+        total_eligible_power: 0,
+        executed_at: None,
+    };
+    
+    env.storage().instance().set(&DataKey::AmendmentAppeal(amendment.amendment_id), &appeal);
+    
+    // Update amendment with appeal reference
+    let mut updated_amendment = amendment.clone();
+    updated_amendment.appeal_id = Some(appeal_id);
+    env.storage().instance().set(&DataKey::GrantAmendment(amendment.grant_id), &updated_amendment);
+    
+    Ok(())
+}
+
+fn get_next_appeal_id(env: &Env) -> u64 {
+    // Simple implementation - in production this would be more sophisticated
+    env.ledger().sequence
+}
+
+// --- Tax Jurisdiction Helper Functions ---
+
+fn read_jurisdiction(env: &Env, code: &str) -> Result<JurisdictionInfo, Error> {
+    env.storage().instance()
+        .get(&DataKey::JurisdictionRegistry(String::from_str_slice(env, code)))
+        .ok_or(Error::JurisdictionNotFound)
+}
+
+fn read_jurisdiction_codes(env: &Env) -> Vec<String> {
+    env.storage().instance()
+        .get(&DataKey::JurisdictionCodes)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn read_grantee_record(env: &Env, grantee_address: &Address) -> Result<GranteeRecord, Error> {
+    env.storage().instance()
+        .get(&DataKey::GranteeJurisdiction(grantee_address))
+        .ok_or(Error::JurisdictionNotFound)
+}
+
+fn read_tax_withholding_reserve(env: &Env) -> Result<Address, Error> {
+    env.storage().instance()
+        .get(&DataKey::TaxWithholdingReserve)
+        .ok_or(Error::JurisdictionRegistryNotSet)
+}
+
+#[cfg(test)]
+mod test_reputation_scoring;
 #[cfg(test)]
 mod test;
 #[cfg(test)]
@@ -5083,4 +4336,4 @@ mod test_yield;
 #[cfg(test)]
 mod test_fee;
 #[cfg(test)]
-mod test_cross_chain_features;
+
