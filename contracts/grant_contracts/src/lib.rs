@@ -66,6 +66,25 @@ const DEFAULT_PRICE_BUFFER_BPS: u32 = 500; // 5% default price buffer for volati
 const MAX_PRICE_DEVIATION_BPS: u32 = 1000; // 10% maximum price deviation allowed
 const DEX_PRICE_EXPIRY_SECS: u64 = 300; // 5 minutes DEX price expiry
 
+// Issue #200: Clawback-Compatible Regulated Asset Handler constants
+const CLAWBACK_SYNC_THRESHOLD_BPS: u32 = 100; // 1% threshold for triggering balance sync
+const REGULATED_ASSET_CHECK_INTERVAL: u64 = 3600; // 1 hour check interval
+
+// Issue #199: Tax Withholding Escrow constants
+const DEFAULT_TAX_WITHHOLDING_BPS: u32 = 1500; // 15% default tax withholding
+const MAX_TAX_WITHHOLDING_BPS: u32 = 3000; // 30% maximum tax withholding
+const TAX_VAULT_VERSION: u32 = 1;
+
+// Issue #197: Legal Entity Verification constants
+const ENTITY_VERIFICATION_VERSION: u32 = 1;
+const ENTITY_CHECK_INTERVAL: u64 = 86400; // 24 hours verification check interval
+const ENTITY_EXPIRY_GRACE_PERIOD: u64 = 7 * 86400; // 7 days grace period after expiry
+
+// Issue #195: Flash Loan Provider constants
+const FLASH_LOAN_FEE_BPS: u32 = 50; // 0.05% flash loan fee
+const MIN_FLASH_LOAN_AMOUNT: i128 = 1_000_000; // Minimum 0.1 XLM flash loan
+const MAX_FLASH_LOAN_AMOUNT: i128 = 10_000_000_000; // Maximum 1000 XLM flash loan
+
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
 // Core logic is now in this file.
@@ -102,6 +121,15 @@ pub fn get_next_grant_id(env: Env) -> u64 {
     if grant_ids.is_empty() {
         return 1;
     }
+
+    let mut max_id = 0u64;
+    for id in grant_ids.iter() {
+        if id > max_id {
+            max_id = id;
+        }
+    }
+    max_id + 1
+}
 
 #[contracttype]
 pub enum DataKey {
@@ -145,6 +173,20 @@ pub fn batch_init_with_deposits(
     if grantee_configs.is_empty() {
         return Err(Error::InvalidAmount);
     }
+
+#[derive(Clone)]
+#[contracttype]
+pub struct Milestone {
+    pub amount: u128,
+    pub description: String,
+    pub approved: bool,
+    pub approved_at: Option<u64>,
+    pub votes_for: u32,
+    pub votes_against: u32,
+    pub voting_deadline: u64,
+    pub acceleration_bps: u32,
+    pub acceleration_duration: u64,
+}
 
 #[derive(Clone)]
 #[contracttype]
@@ -731,6 +773,107 @@ pub struct DexPriceUpdate {
     pub confidence_bps: u32,      // Price confidence in basis points (10000 = 100%)
 }
 
+// Issue #200: Clawback-Compatible Regulated Asset Handler structures
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct RegulatedAssetInfo {
+    pub asset_address: Address,
+    pub is_regulated: bool,
+    pub clawback_enabled: bool,
+    pub last_balance_check: u64,
+    pub last_known_balance: i128,
+    pub balance_sync_threshold: i128,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct BalanceSyncRecord {
+    pub grant_id: u64,
+    pub asset_address: Address,
+    pub previous_balance: i128,
+    pub new_balance: i128,
+    pub clawback_amount: i128,
+    pub sync_timestamp: u64,
+    pub streams_affected: u32,
+}
+
+// Issue #199: Tax Withholding Escrow structures
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct TaxVault {
+    pub grant_id: u64,
+    pub total_withheld: i128,
+    pub total_withdrawn_by_grantor: i128,
+    pub tax_rate_bps: u32,
+    pub created_at: u64,
+    pub last_withholding_timestamp: u64,
+    pub version: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct TaxReceipt {
+    pub receipt_id: u64,
+    pub grant_id: u64,
+    pub grantee: Address,
+    pub amount_withheld: i128,
+    pub tax_rate_bps: u32,
+    pub period_start: u64,
+    pub period_end: u64,
+    pub receipt_timestamp: u64,
+    pub receipt_hash: [u8; 32],
+}
+
+// Issue #197: Legal Entity Verification structures
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct LegalEntityVerification {
+    pub entity_address: Address,
+    pub entity_type: String,        // "LLC", "NGO", "CORP", etc.
+    pub jurisdiction: String,       // Country/state of registration
+    pub registration_number: String,
+    pub verified_at: u64,
+    pub expires_at: u64,
+    pub is_active: bool,
+    pub identity_oracle: Address,
+    pub verification_version: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct EntityVerificationHook {
+    pub grant_id: u64,
+    pub entity_address: Address,
+    pub last_check: u64,
+    pub verification_status: bool,
+    pub auto_pause_enabled: bool,
+}
+
+// Issue #195: Flash Loan Provider structures
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct FlashLoan {
+    pub loan_id: u64,
+    pub borrower: Address,
+    pub amount: i128,
+    pub fee: i128,
+    pub asset_address: Address,
+    pub started_at: u64,
+    pub repaid_at: Option<u64>,
+    pub is_active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct FlashLoanProvider {
+    pub treasury_address: Address,
+    pub total_loans_issued: u64,
+    pub total_fees_earned: i128,
+    pub active_loans: u64,
+    pub max_concurrent_loans: u32,
+    pub provider_enabled: bool,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub enum GrantError {
@@ -830,6 +973,29 @@ enum DataKey {
     // Task #192: Batch refund tracking
     DonorRecord(u64, Address), // Maps grant_id + donor to contribution amount
     GrantDonors(u64),          // List of donors for a grant
+    
+    // Issue #200: Clawback-Compatible Regulated Asset Handler storage
+    RegulatedAssetInfo(Address), // Maps asset address to regulated asset info
+    BalanceSyncRecord(u64),     // Maps sync_id to balance sync record
+    NextBalanceSyncId,         // Next available balance sync ID
+    RegulatedAssetClawbackLog(Address), // Maps asset to clawback history
+    
+    // Issue #199: Tax Withholding Escrow storage
+    TaxVault(u64),             // Maps grant_id to tax vault
+    TaxReceipt(u64),          // Maps receipt_id to tax receipt
+    NextTaxReceiptId,          // Next available tax receipt ID
+    GrantTaxRate(u64),         // Maps grant_id to tax rate
+    
+    // Issue #197: Legal Entity Verification storage
+    LegalEntityVerification(Address), // Maps entity address to verification
+    EntityVerificationHook(u64), // Maps grant_id to verification hook
+    IdentityOracleContract,    // Address of identity oracle contract
+    
+    // Issue #195: Flash Loan Provider storage
+    FlashLoan(u64),            // Maps loan_id to flash loan
+    FlashLoanProvider,         // Flash loan provider configuration
+    NextFlashLoanId,           // Next available flash loan ID
+    ActiveFlashLoans,         // Count of active flash loans
 }
 
 #[contracterror]
@@ -944,6 +1110,31 @@ pub enum Error {
     InsufficientMatchingPool = 74,
     PriceVolatilityExceeded = 75,
     InvalidPriceBuffer = 76,
+    
+    // Issue #200: Clawback-Compatible Regulated Asset Handler errors
+    RegulatedAssetClawbackDetected = 77,
+    BalanceSyncFailed = 78,
+    InsufficientRegulatedBalance = 79,
+    RegulatedAssetNotSupported = 80,
+    
+    // Issue #199: Tax Withholding Escrow errors
+    TaxWithholdingTooHigh = 81,
+    TaxVaultNotFound = 82,
+    InsufficientTaxVault = 83,
+    TaxReceiptAlreadyIssued = 84,
+    
+    // Issue #197: Legal Entity Verification errors
+    EntityNotVerified = 85,
+    EntityVerificationExpired = 86,
+    IdentityOracleNotFound = 87,
+    EntityVerificationRevoked = 88,
+    
+    // Issue #195: Flash Loan Provider errors
+    FlashLoanAmountTooSmall = 89,
+    FlashLoanAmountTooLarge = 90,
+    FlashLoanNotRepaid = 91,
+    FlashLoanFeeNotPaid = 92,
+    FlashLoanInProgress = 93,
 }
 
 // --- Internal Helpers ---
@@ -1817,52 +2008,6 @@ impl GrantContract {
     ) -> Result<BatchInitResult, Error> {
         require_admin_auth(&env)?;
 
-    pub fn configure_milestone_acceleration(
-        env: Env,
-        grant_id: Symbol,
-        milestone_id: Symbol,
-        acceleration_bps: u32,
-        acceleration_duration: u64,
-    ) {
-        let grant = Self::load_grant(&env, &grant_id);
-        grant.admin.require_auth();
-
-        if acceleration_bps == 0 || acceleration_duration == 0 {
-            panic_with_error!(&env, GrantError::InvalidAccelerationConfig);
-        }
-
-        let milestone_key = DataKey::Milestone(grant_id, milestone_id);
-        let mut milestone = Self::load_milestone(&env, &milestone_key);
-        if milestone.approved {
-            panic_with_error!(&env, GrantError::AlreadyApproved);
-        }
-
-        milestone.acceleration_bps = acceleration_bps;
-        milestone.acceleration_duration = acceleration_duration;
-        env.storage().instance().set(&milestone_key, &milestone);
-    }
-
-    pub fn propose_milestone_approval(env: Env, grant_id: Symbol, milestone_id: Symbol) {
-        let grant = Self::load_grant(&env, &grant_id);
-        grant.admin.require_auth();
-
-        let milestone_key = DataKey::Milestone(grant_id.clone(), milestone_id.clone());
-        let mut milestone = Self::load_milestone(&env, &milestone_key);
-        if milestone.approved {
-            panic_with_error!(&env, GrantError::AlreadyApproved);
-        }
-
-        milestone.votes_for = 0;
-        milestone.votes_against = 0;
-        milestone.voting_deadline = env.ledger().timestamp().saturating_add(7 * 24 * 60 * 60);
-
-        for member in grant.council_members.iter() {
-            env.storage().instance().remove(&DataKey::MilestoneVote(
-                grant_id.clone(),
-                milestone_id.clone(),
-                member,
-            ));
-        }
         if grantee_configs.is_empty() {
             return Err(Error::InvalidAmount);
         }
@@ -1927,27 +2072,38 @@ impl GrantContract {
                 stream_type: StreamType::FixedAmount,
                 start_time: now,
                 warmup_duration: config.warmup_duration,
+                required_stake: 0,
+                staked_amount: 0,
+                stake_token: config.asset.clone(),
+                slash_reason: None,
+                lessor: config.recipient.clone(),
+                property_id: String::from_str(&env, ""),
+                serial_number: String::from_str(&env, ""),
+                security_deposit: 0,
+                lease_end_time: 0,
+                lease_terminated: false,
+                remaining_balance: config.total_amount,
+                linked_addresses: config.linked_addresses.clone(),
+                milestone_amount: config.milestone_amount,
+                total_milestones: config.total_milestones,
+                claimed_milestones: 0,
+                available_milestone_funds: config.milestone_amount * config.total_milestones as i128,
+                last_resume_timestamp: None,
+                pause_count: 0,
+                gas_buffer: config.gas_buffer,
+                gas_buffer_used: 0,
+                max_withdrawal_per_day: config.total_amount / 30, // 1/30th per day default
+                last_withdrawal_timestamp: now,
+                withdrawal_amount_today: 0,
+                base_flow_rate: config.flow_rate,
                 validator: config.validator.clone(),
                 validator_withdrawn: 0,
                 validator_claimable: 0,
-                
-                // Pause cooldown fields
-                last_resume_timestamp: None,
-                pause_count: 0,
             };
 
             // Store the grant
             env.storage().instance().set(&key, &grant);
             grant_ids.push_back(current_grant_id);
-
-            // Update recipient grants index
-            let recipient_key = DataKey::RecipientGrants(config.recipient.clone());
-            let mut user_grants: Vec<u64> = env.storage()
-                .instance()
-                .get(&recipient_key)
-                .unwrap_or_else(|| Vec::new(&env));
-            user_grants.push_back(current_grant_id);
-            env.storage().instance().set(&recipient_key, &user_grants);
 
             successful_grants.push_back(current_grant_id);
             total_deposited = total_deposited
@@ -1959,6 +2115,76 @@ impl GrantContract {
 
         // Update grant IDs list
         env.storage().instance().set(&DataKey::GrantIds, &grant_ids);
+
+        let result = BatchInitResult {
+            successful_grants: successful_grants.clone(),
+            failed_grants,
+            total_deposited,
+            grants_created: successful_grants.len(),
+        };
+
+        // Emit batch creation event
+        env.events().publish(
+            (symbol_short!("batch_init"),),
+            (
+                result.grants_created,
+                result.total_deposited,
+                starting_grant_id,
+            ),
+        );
+
+        Ok(result)
+    }
+
+    pub fn configure_milestone_acceleration(
+        env: Env,
+        grant_id: Symbol,
+        milestone_id: Symbol,
+        acceleration_bps: u32,
+        acceleration_duration: u64,
+    ) {
+        let grant = Self::load_grant(&env, &grant_id);
+        grant.admin.require_auth();
+
+        if acceleration_bps == 0 || acceleration_duration == 0 {
+            panic_with_error!(&env, GrantError::InvalidAccelerationConfig);
+        }
+
+        let milestone_key = DataKey::Milestone(grant_id, milestone_id);
+        let mut milestone = Self::load_milestone(&env, &milestone_key);
+        if milestone.approved {
+            panic_with_error!(&env, GrantError::AlreadyApproved);
+        }
+
+        milestone.acceleration_bps = acceleration_bps;
+        milestone.acceleration_duration = acceleration_duration;
+        env.storage().instance().set(&milestone_key, &milestone);
+    }
+
+    pub fn propose_milestone_approval(env: Env, grant_id: Symbol, milestone_id: Symbol) {
+        let grant = Self::load_grant(&env, &grant_id);
+        grant.admin.require_auth();
+
+        let milestone_key = DataKey::Milestone(grant_id.clone(), milestone_id.clone());
+        let mut milestone = Self::load_milestone(&env, &milestone_key);
+        if milestone.approved {
+            panic_with_error!(&env, GrantError::AlreadyApproved);
+        }
+
+        milestone.votes_for = 0;
+        milestone.votes_against = 0;
+        milestone.voting_deadline = env.ledger().timestamp().saturating_add(7 * 24 * 60 * 60);
+
+        for member in grant.council_members.iter() {
+            env.storage().instance().remove(&DataKey::MilestoneVote(
+                grant_id.clone(),
+                milestone_id.clone(),
+                member,
+            ));
+        }
+        
+        env.storage().instance().set(&milestone_key, &milestone);
+    }
 
     pub fn vote_milestone(
         env: Env,
@@ -1972,25 +2198,37 @@ impl GrantContract {
         let mut grant = Self::load_grant(&env, &grant_id);
         let milestone_key = DataKey::Milestone(grant_id.clone(), milestone_id.clone());
         let mut milestone = Self::load_milestone(&env, &milestone_key);
-        let result = BatchInitResult {
-            successful_grants: successful_grants.clone(),
-            failed_grants,
-            total_deposited,
-            grants_created: successful_grants.len(),
-        };
+        
+        if env.ledger().timestamp() > milestone.voting_deadline {
+            panic_with_error!(&env, GrantError::VotingExpired);
+        }
+        if !Self::is_council_member(&grant, &voter) {
+            panic_with_error!(&env, GrantError::NotCouncilMember);
+        }
 
-        // Emit batch creation event
-        env.events().publish(
-            (symbol_short!("batch"),),
-            (
-                result.grants_created,
-                result.total_deposited,
-                starting_grant_id,
-                now,
-            ),
-        );
+        let vote_key = DataKey::MilestoneVote(grant_id.clone(), milestone_id.clone(), voter);
+        if env.storage().instance().has(&vote_key) {
+            panic_with_error!(&env, GrantError::AlreadyVoted);
+        }
+        env.storage().instance().set(&vote_key, &approve);
 
-        Ok(result)
+        if approve {
+            milestone.votes_for = milestone.votes_for.saturating_add(1);
+        } else {
+            milestone.votes_against = milestone.votes_against.saturating_add(1);
+        }
+
+        if milestone.votes_for >= grant.voting_threshold {
+            Self::finalize_milestone_approval(
+                &env,
+                &grant_id,
+                &milestone_id,
+                &mut grant,
+                &mut milestone,
+            );
+        }
+
+        env.storage().instance().set(&milestone_key, &milestone);
     }
 
     pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
@@ -2032,39 +2270,23 @@ impl GrantContract {
         if amount > grant.claimable {
             return Err(Error::InvalidAmount);
         }
-        if env.ledger().timestamp() > milestone.voting_deadline {
-            panic_with_error!(&env, GrantError::VotingExpired);
-        }
-        if !Self::is_council_member(&grant, &voter) {
-            panic_with_error!(&env, GrantError::NotCouncilMember);
-        }
 
-        let vote_key = DataKey::MilestoneVote(grant_id.clone(), milestone_id.clone(), voter);
-        if env.storage().instance().has(&vote_key) {
-            panic_with_error!(&env, GrantError::AlreadyVoted);
-        }
-        env.storage().instance().set(&vote_key, &approve);
+        grant.claimable -= amount;
+        grant.withdrawn += amount;
 
-        if approve {
-            milestone.votes_for = milestone.votes_for.saturating_add(1);
-        } else {
-            milestone.votes_against = milestone.votes_against.saturating_add(1);
-        }
+        let token_client = token::Client::new(&env, &grant.token_address);
+        token_client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
 
-        if milestone.votes_for >= grant.voting_threshold {
-            Self::finalize_milestone_approval(
-                &env,
-                &grant_id,
-                &milestone_id,
-                &mut grant,
-                &mut milestone,
-            );
-        }
+        write_grant(&env, grant_id, &grant);
 
-        env.storage().instance().set(&milestone_key, &milestone);
-        env.storage()
-            .instance()
-            .set(&DataKey::Grant(grant_id), &grant);
+        env.events().publish(
+            (symbol_short!("withdraw"), grant_id),
+            (amount, grant.recipient.clone()),
+        );
+
+        try_call_on_withdraw(&env, &grant.recipient, grant_id, amount);
+
+        Ok(())
     }
 
     pub fn approve_milestone(env: Env, grant_id: Symbol, milestone_id: Symbol) {
@@ -2087,39 +2309,75 @@ impl GrantContract {
             .set(&DataKey::Grant(grant_id), &grant);
     }
 
-    pub fn withdraw(env: Env, grant_id: Symbol, caller: Address) -> u128 {
-        caller.require_auth();
+    fn finalize_milestone_approval(
+        env: &Env,
+        grant_id: &Symbol,
+        milestone_id: &Symbol,
+        grant: &mut Grant,
+        milestone: &mut Milestone,
+    ) {
+        milestone.approved = true;
+        milestone.approved_at = Some(env.ledger().timestamp());
 
-        let grant = Self::load_grant(&env, &grant_id);
-        let share = match grant.grantees.get(caller.clone()) {
-            Some(share) => share,
-            None => panic_with_error!(&env, GrantError::InvalidGrantee),
-        };
+        // Release milestone funds to grantee
+        let token_client = token::Client::new(env, &grant.token_address);
+        token_client.transfer(&env.current_contract_address(), &grant.recipient, &milestone.amount);
 
-        let available =
-            Self::compute_withdrawable_amount(&env, &grant, &grant_id, caller.clone(), share);
-        if available == 0 {
-            return 0;
-        }
+        // Update grant state
+        grant.claimed_milestones += 1;
+        grant.withdrawn += milestone.amount;
 
-        let withdrawn_key = DataKey::Withdrawn(grant_id, caller.clone());
-        let already_withdrawn = env
-            .storage()
-            .instance()
-            .get::<_, u128>(&withdrawn_key)
-            .unwrap_or(0);
+        env.events().publish(
+            (symbol_short!("milestone_approved"), grant_id, milestone_id),
+            (milestone.amount, grant.recipient.clone()),
+        );
+    }
+
+    fn is_council_member(grant: &Grant, member: &Address) -> bool {
+        grant.council_members.iter().any(|council_member| council_member == member)
+    }
+
+    fn load_grant(env: &Env, grant_id: &Symbol) -> Grant {
         env.storage()
             .instance()
-            .set(&withdrawn_key, &already_withdrawn.saturating_add(available));
+            .get(&DataKey::Grant(grant_id.clone()))
+            .unwrap()
+    }
 
-        Self::transfer_tokens(
-            &env,
-            &grant.token_address,
-            &env.current_contract_address(),
-            &caller,
-            available,
-        );
-        available
+    fn load_milestone(env: &Env, milestone_key: &DataKey) -> Milestone {
+        env.storage()
+            .instance()
+            .get(milestone_key)
+            .unwrap()
+    }
+
+    fn transfer_tokens(
+        env: &Env,
+        token_address: &Address,
+        from: &Address,
+        to: &Address,
+        amount: u128,
+    ) {
+        let token_client = token::Client::new(env, token_address);
+        token_client.transfer(from, to, &amount);
+    }
+
+    fn compute_withdrawable_amount(
+        env: &Env,
+        grant: &Grant,
+        grant_id: &Symbol,
+        caller: Address,
+        share: u32,
+    ) -> u128 {
+        // Simplified calculation - in real implementation this would be more complex
+        grant.total_amount / grant.grantees.len() as u128
+    }
+
+    fn get_total_voting_power(env: &Env) -> Result<i128, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalVotingPower)
+            .ok_or(Error::NotInitialized)
     }
 
     pub fn activate_grant(env: Env, grant_id: Symbol) {
@@ -2133,19 +2391,13 @@ impl GrantContract {
                     .instance()
                     .set(&DataKey::Grant(grant_id), &grant);
 
-        grant.claimable = grant.claimable.checked_sub(amount).ok_or(Error::MathOverflow)?;
-        grant.withdrawn = grant.withdrawn.checked_add(amount).ok_or(Error::MathOverflow)?;
-        grant.last_claim_time = env.ledger().timestamp();
-
-        write_grant(&env, grant_id, &grant);
-
-        let token_addr = read_grant_token(&env)?;
-        let client = token::Client::new(&env, &token_addr);
-
-
-        try_call_on_withdraw(&env, &grant.recipient, grant_id, amount);
-
-        Ok(())
+                env.events().publish(
+                    (symbol_short!("grant_activated"), grant_id),
+                    (grant.recipient.clone(),),
+                );
+            }
+            _ => panic_with_error!(&env, GrantError::InvalidState),
+        }
     }
 
     pub fn pause_stream(env: Env, caller: Address, grant_id: u64, reason: String, is_emergency: bool, voting_power: Option<i128>) -> Result<u64, Error> {
@@ -2520,28 +2772,17 @@ impl GrantContract {
     }
 
     pub fn cancel_grant(env: Env, caller: Address, grant_id: u64, reason: String) -> Result<u64, Error> {
-    pub fn pause_grant(env: Env, grant_id: Symbol) {
-        let mut grant = Self::load_grant(&env, &grant_id);
-        grant.admin.require_auth();
-
-        match grant.status {
-            GrantStatus::Active => {
-                grant.status = GrantStatus::Paused;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Grant(grant_id), &grant);
-            }
-            _ => panic_with_error!(&env, GrantError::InvalidStatus),
-    pub fn cancel_grant(env: Env, grant_id: u64) -> Result<(), Error> {
+        require_admin_auth(&env)?;
         let mut grant = read_grant(&env, grant_id)?;
 
         if grant.status == GrantStatus::Completed || grant.status == GrantStatus::RageQuitted {
             return Err(Error::InvalidState);
         }
 
-
+        settle_grant(&mut grant, env.ledger().timestamp())?;
         grant.status = GrantStatus::Cancelled;
         write_grant(&env, grant_id, &grant);
+
         // Check authorization: either admin or authorized Sub-DAO
         let action_id = if require_admin_auth(&env).is_ok() {
             // Admin authorized - proceed directly
@@ -2566,47 +2807,48 @@ impl GrantContract {
             // Log admin action
             env.events().publish(
                 (symbol_short!("admin_cancel"),),
-                (grant_id, caller, reason),
+                (grant_id, caller, reason, grant.pause_count),
             );
             0 // Admin actions don't need Sub-DAO tracking
         } else {
             // Check Sub-DAO authorization and log action
             let sub_dao_contract = read_sub_dao_authority_contract(&env)?;
             
-            // This would call SubDaoAuthority::delegated_clawback_grant in production
+            // This would call SubDaoAuthority::delegated_cancel_grant in production
             check_sub_dao_permission(&env, &caller, grant_id, "cancel")?;
             
             settle_grant(&mut grant, env.ledger().timestamp())?;
-
-            // Remaining = total - already withdrawn - pending claimable (both sides)
-            let total_paid = grant.withdrawn
-                .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
-                .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
-                .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
-            let remaining = grant.total_amount.checked_sub(total_paid).ok_or(Error::MathOverflow)?;
             grant.status = GrantStatus::Cancelled;
             write_grant(&env, grant_id, &grant);
-
-            if remaining > 0 {
-                let token_addr = read_grant_token(&env)?;
-                let client = token::Client::new(&env, &token_addr);
-                let treasury = read_treasury(&env)?;
-                client.transfer(&env.current_contract_address(), &treasury, &remaining);
-            }
-
+            
             // Generate action ID for tracking
             let action_id = env.ledger().sequence();
-
-            // Emit delegated clawback event
+            
+            // Emit delegated cancel event
             env.events().publish(
-                (symbol_short!("delegated_clawback"),),
-                (caller, grant_id, action_id, reason),
+                (symbol_short!("delegated_cancel"),),
+                (caller, grant_id, action_id, reason, grant.pause_count),
             );
-
+            
             action_id
         };
-
+        
         Ok(action_id)
+    }
+
+    pub fn pause_grant(env: Env, grant_id: Symbol) {
+        let mut grant = Self::load_grant(&env, &grant_id);
+        grant.admin.require_auth();
+
+        match grant.status {
+            GrantStatus::Active => {
+                grant.status = GrantStatus::Paused;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Grant(grant_id), &grant);
+            }
+            _ => panic_with_error!(&env, GrantError::InvalidStatus),
+        }
     }
 
     pub fn resume_grant(env: Env, grant_id: Symbol) {
@@ -2621,6 +2863,9 @@ impl GrantContract {
                     .set(&DataKey::Grant(grant_id), &grant);
             }
             _ => panic_with_error!(&env, GrantError::InvalidStatus),
+        }
+    }
+
     pub fn rescue_tokens(env: Env, token_address: Address, amount: i128, to: Address) -> Result<(), Error> {
         require_admin_auth(&env)?;
         if amount <= 0 { return Err(Error::InvalidAmount); }
@@ -2654,6 +2899,9 @@ impl GrantContract {
                     .set(&DataKey::Grant(grant_id), &grant);
             }
             _ => panic_with_error!(&env, GrantError::InvalidStatus),
+        }
+    }
+
     pub fn get_grant(env: Env, grant_id: u64) -> Result<Grant, Error> {
         read_grant(&env, grant_id)
     }
@@ -2823,51 +3071,53 @@ impl GrantContract {
     }
 }
 
-impl GrantContract {
-    fn finalize_milestone_approval(
-        env: &Env,
-        grant_id: &Symbol,
-        milestone_id: &Symbol,
-        grant: &mut Grant,
-        milestone: &mut Milestone,
-    ) {
-        if milestone.approved {
-            panic_with_error!(env, GrantError::AlreadyApproved);
+// Helper functions for milestone approval
+fn finalize_milestone_approval(
+    env: &Env,
+    grant_id: &Symbol,
+    milestone_id: &Symbol,
+    grant: &mut Grant,
+    milestone: &mut Milestone,
+) {
+    if milestone.approved {
+        panic_with_error!(env, GrantError::AlreadyApproved);
+    }
+    match grant.status {
+        GrantStatus::Cancelled | GrantStatus::Paused => {
+            panic_with_error!(env, GrantError::InvalidStatus);
         }
-        match grant.status {
-            GrantStatus::Cancelled | GrantStatus::Paused => {
-                panic_with_error!(env, GrantError::InvalidStatus);
-            }
-            _ => {}
+        _ => {
+            // Continue with approval
         }
+    }
 
-        let new_released = grant
-            .released_amount
-            .checked_add(milestone.amount)
-            .unwrap_or_else(|| panic_with_error!(env, GrantError::ExceedsTotalAmount));
-        if new_released > grant.total_amount {
-            panic_with_error!(env, GrantError::ExceedsTotalAmount);
-        }
+    let new_released = grant
+        .released_amount
+        .checked_add(milestone.amount)
+        .unwrap_or_else(|| panic_with_error!(env, GrantError::ExceedsTotalAmount));
+    if new_released > grant.total_amount {
+        panic_with_error!(env, GrantError::ExceedsTotalAmount);
+    }
 
-        milestone.approved = true;
-        milestone.approved_at = Some(env.ledger().timestamp());
-        grant.released_amount = new_released;
+    milestone.approved = true;
+    milestone.approved_at = Some(env.ledger().timestamp());
+    grant.released_amount = new_released;
 
-        if milestone.acceleration_bps > 0 && milestone.acceleration_duration > 0 {
-            grant.acceleration_windows.push_back(StreamAcceleration {
-                milestone_id: milestone_id.clone(),
-                activated_at: env.ledger().timestamp(),
-                expires_at: env
-                    .ledger()
-                    .timestamp()
-                    .saturating_add(milestone.acceleration_duration),
-                bonus_bps: milestone.acceleration_bps,
-            });
-        }
+    if milestone.acceleration_bps > 0 && milestone.acceleration_duration > 0 {
+        grant.acceleration_windows.push_back(StreamAcceleration {
+            milestone_id: milestone_id.clone(),
+            activated_at: env.ledger().timestamp(),
+            expires_at: env
+                .ledger()
+                .timestamp()
+                .saturating_add(milestone.acceleration_duration),
+            bonus_bps: milestone.acceleration_bps,
+        });
+    }
 
-        if grant.released_amount == grant.total_amount {
-            grant.status = GrantStatus::Completed;
-        }
+    if grant.released_amount == grant.total_amount {
+        grant.status = GrantStatus::Completed;
+    }
 
         Self::transfer_tokens(
             env,
@@ -2878,7 +3128,15 @@ impl GrantContract {
         );
         env.storage()
             .instance()
+            .set(&DataKey::Milestone(grant_id.clone(), milestone_id.clone()), milestone);
+        env.storage()
+            .instance()
             .set(&DataKey::Grant(grant_id.clone()), grant);
+
+        env.events().publish(
+            (symbol_short!("milestone_approved"), grant_id, milestone_id),
+            (milestone.amount, grant.recipient.clone()),
+        );
     }
 
     fn compute_withdrawable_amount(
@@ -2895,7 +3153,13 @@ impl GrantContract {
         match grant.status {
             GrantStatus::Proposed | GrantStatus::Paused | GrantStatus::Cancelled => return 0,
             _ => {}
-    pub fn verify_financial_snapshot(
+        }
+        
+        // Simplified calculation for demonstration
+        grant.total_amount / grant.grantees.len() as u128
+    }
+
+    fn verify_financial_snapshot(
         env: Env, 
         grant_id: u64, 
         timestamp: u64,
@@ -2987,6 +3251,8 @@ impl GrantContract {
         amount: u128,
     ) {
         token::Client::new(env, token_address).transfer(from, to, &(amount as i128));
+    }
+
     pub fn get_snapshot_info(env: Env, grant_id: u64, timestamp: u64) -> Result<FinancialSnapshot, Error> {
         let snapshot = read_financial_snapshot(&env, grant_id, timestamp)?;
         
@@ -3212,6 +3478,16 @@ pub mod grant {
     use crate::StreamAcceleration;
 
     pub fn compute_claimable_balance(total: u128, start: u64, now: u64, duration: u64) -> u128 {
+        if duration == 0 {
+            return if now >= start { total } else { 0 };
+        }
+        if now <= start {
+            return 0;
+        }
+        let elapsed = min(now - start, duration);
+        total * elapsed / duration
+    }
+
     pub fn get_slashing_proposal(env: Env, proposal_id: u64) -> Result<SlashingProposal, Error> {
         read_slashing_proposal(&env, proposal_id)
     }
@@ -3235,6 +3511,9 @@ pub mod grant {
             power,
         );
         
+        Ok(())
+    }
+
     /// Compute the claimable balance for exponential vesting.
     /// Rate increases as project nears completion.
     /// Formula: total * (1 - exp(-factor * progress)) / (1 - exp(-factor))
@@ -4376,6 +4655,8 @@ pub mod grant {
         }
         
         Ok(true)
+    }
+
     // ============================================================
     // TASK 1: WITHDRAW ALL - Multi-Grant Batch Withdrawal
     // ============================================================
@@ -5042,6 +5323,743 @@ pub mod grant {
             .get(&DataKey::DexPriceBuffer)
             .ok_or(Error::PriceOracleNotFound)
     }
+
+    // ========================================
+    // ISSUE #200: CLAWBACK-COMPATIBLE REGULATED ASSET HANDLER
+    // ========================================
+
+    /// Initialize regulated asset monitoring for clawback detection
+    pub fn initialize_regulated_asset(
+        env: Env,
+        asset_address: Address,
+        clawback_enabled: bool,
+        balance_sync_threshold_bps: Option<u32>,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        let threshold_bps = balance_sync_threshold_bps.unwrap_or(CLAWBACK_SYNC_THRESHOLD_BPS);
+        if threshold_bps > 10000 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let token_client = token::Client::new(&env, &asset_address);
+        let current_balance = token_client.balance(&env.current_contract_address());
+        let sync_threshold = (current_balance * threshold_bps as i128) / 10000;
+
+        let asset_info = RegulatedAssetInfo {
+            asset_address: asset_address.clone(),
+            is_regulated: true,
+            clawback_enabled,
+            last_balance_check: env.ledger().timestamp(),
+            last_known_balance: current_balance,
+            balance_sync_threshold: sync_threshold,
+        };
+
+        env.storage().instance().set(&DataKey::RegulatedAssetInfo(asset_address), &asset_info);
+
+        env.events().publish(
+            (symbol_short!("regulated_asset_init"), asset_address),
+            (clawback_enabled, threshold_bps, current_balance),
+        );
+
+        Ok(())
+    }
+
+    /// Balance sync function for regulated assets
+    /// Detects external clawbacks and recalibrates streams pro-rata
+    pub fn balance_sync(env: Env, asset_address: Address) -> Result<BalanceSyncRecord, Error> {
+        let mut asset_info = env.storage().instance()
+            .get::<_, RegulatedAssetInfo>(&DataKey::RegulatedAssetInfo(asset_address.clone()))
+            .ok_or(Error::RegulatedAssetNotSupported)?;
+
+        if !asset_info.clawback_enabled {
+            return Err(Error::RegulatedAssetNotSupported);
+        }
+
+        let token_client = token::Client::new(&env, &asset_address);
+        let current_balance = token_client.balance(&env.current_contract_address());
+        let previous_balance = asset_info.last_known_balance;
+
+        // Check if balance decreased significantly (indicating clawback)
+        if current_balance < previous_balance {
+            let clawback_amount = previous_balance - current_balance;
+            
+            // Only trigger sync if decrease exceeds threshold
+            if clawback_amount >= asset_info.balance_sync_threshold {
+                // Create balance sync record
+                let sync_id = read_next_balance_sync_id(&env);
+                let sync_record = BalanceSyncRecord {
+                    grant_id: 0, // Will be updated below
+                    asset_address: asset_address.clone(),
+                    previous_balance,
+                    new_balance: current_balance,
+                    clawback_amount,
+                    sync_timestamp: env.ledger().timestamp(),
+                    streams_affected: 0, // Will be calculated below
+                };
+
+                // Get all active grants using this asset
+                let grant_ids = read_grant_ids(&env);
+                let mut streams_affected = 0u32;
+
+                for grant_id in grant_ids.iter() {
+                    if let Ok(mut grant) = read_grant(&env, *grant_id) {
+                        if grant.token_address == asset_address && grant.status == GrantStatus::Active {
+                            // Recalibrate stream pro-rata
+                            let total_allocated = grant.total_amount;
+                            let new_total = current_balance;
+                            
+                            if new_total > 0 {
+                                let reduction_ratio = (new_total * SCALING_FACTOR) / total_allocated;
+                                grant.flow_rate = (grant.flow_rate * reduction_ratio) / SCALING_FACTOR;
+                                grant.total_amount = new_total;
+                                
+                                write_grant(&env, *grant_id, &grant);
+                                streams_affected += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Update sync record
+                let mut final_sync_record = sync_record;
+                final_sync_record.streams_affected = streams_affected;
+                
+                // Store sync record
+                write_balance_sync_record(&env, sync_id, &final_sync_record);
+                write_next_balance_sync_id(&env, sync_id + 1);
+
+                // Update asset info
+                asset_info.last_known_balance = current_balance;
+                asset_info.last_balance_check = env.ledger().timestamp();
+                env.storage().instance().set(&DataKey::RegulatedAssetInfo(asset_address.clone()), &asset_info);
+
+                // Emit critical event for external clawback detection
+                env.events().publish(
+                    (symbol_short!("external_clawback_detected"), asset_address),
+                    (clawback_amount, streams_affected, sync_id),
+                );
+
+                return Ok(final_sync_record);
+            }
+        }
+
+        // Update last check time even if no clawback detected
+        asset_info.last_balance_check = env.ledger().timestamp();
+        env.storage().instance().set(&DataKey::RegulatedAssetInfo(asset_address), &asset_info);
+
+        Err(Error::BalanceSyncFailed)
+    }
+
+    /// Get regulated asset information
+    pub fn get_regulated_asset_info(env: Env, asset_address: Address) -> Result<RegulatedAssetInfo, Error> {
+        env.storage().instance()
+            .get(&DataKey::RegulatedAssetInfo(asset_address))
+            .ok_or(Error::RegulatedAssetNotSupported)
+    }
+
+    // ========================================
+    // ISSUE #199: TAX WITHHOLDING ESCROW FOR INTERNATIONAL GRANTS
+    // ========================================
+
+    /// Initialize tax withholding for a grant
+    pub fn initialize_tax_withholding(
+        env: Env,
+        grant_id: u64,
+        tax_rate_bps: u32,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        // Validate tax rate
+        if tax_rate_bps > MAX_TAX_WITHHOLDING_BPS {
+            return Err(Error::TaxWithholdingTooHigh);
+        }
+        
+        // Verify grant exists
+        let _grant = read_grant(&env, grant_id)?;
+        
+        // Create tax vault
+        let tax_vault = TaxVault {
+            grant_id,
+            total_withheld: 0,
+            total_withdrawn_by_grantor: 0,
+            tax_rate_bps,
+            created_at: env.ledger().timestamp(),
+            last_withholding_timestamp: 0,
+            version: TAX_VAULT_VERSION,
+        };
+        
+        env.storage().instance().set(&DataKey::TaxVault(grant_id), &tax_vault);
+        env.storage().instance().set(&DataKey::GrantTaxRate(grant_id), &tax_rate_bps);
+        
+        env.events().publish(
+            (symbol_short!("tax_vault_init"), grant_id),
+            (tax_rate_bps,),
+        );
+        
+        Ok(())
+    }
+
+    /// Override withdraw function to include tax withholding
+    pub fn withdraw_with_tax(
+        env: Env,
+        grant_id: u64,
+        amount: i128,
+    ) -> Result<(i128, i128), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+
+        if grant.status != GrantStatus::Active {
+            return Err(Error::InvalidState);
+        }
+
+        if amount > grant.claimable || amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Check if tax withholding is enabled for this grant
+        let tax_rate_bps = env.storage().instance()
+            .get::<_, u32>(&DataKey::GrantTaxRate(grant_id))
+            .unwrap_or(0);
+        
+        let tax_amount = if tax_rate_bps > 0 {
+            (amount * tax_rate_bps as i128) / 10000
+        } else {
+            0
+        };
+        
+        let net_amount = amount - tax_amount;
+        
+        // Update grant
+        grant.claimable -= amount;
+        grant.withdrawn += amount;
+        write_grant(&env, grant_id, &grant);
+        
+        // Transfer net amount to grantee
+        if net_amount > 0 {
+            let token_client = token::Client::new(&env, &grant.token_address);
+            token_client.transfer(&env.current_contract_address(), &grant.recipient, &net_amount);
+        }
+        
+        // Handle tax withholding
+        if tax_amount > 0 {
+            Self::withhold_tax(&env, grant_id, tax_amount, amount)?;
+        }
+        
+        env.events().publish(
+            (symbol_short!("withdraw_with_tax"), grant_id),
+            (amount, net_amount, tax_amount, tax_rate_bps),
+        );
+        
+        Ok((net_amount, tax_amount))
+    }
+
+    /// Withhold tax and store in tax vault
+    fn withhold_tax(
+        env: &Env,
+        grant_id: u64,
+        tax_amount: i128,
+        gross_amount: i128,
+    ) -> Result<(), Error> {
+        let mut tax_vault = env.storage().instance()
+            .get::<_, TaxVault>(&DataKey::TaxVault(grant_id))
+            .ok_or(Error::TaxVaultNotFound)?;
+        
+        tax_vault.total_withheld += tax_amount;
+        tax_vault.last_withholding_timestamp = env.ledger().timestamp();
+        
+        env.storage().instance().set(&DataKey::TaxVault(grant_id), &tax_vault);
+        
+        // Generate tax receipt
+        let receipt_id = read_next_tax_receipt_id(env);
+        let receipt = TaxReceipt {
+            receipt_id,
+            grant_id,
+            grantee: read_grant(env, grant_id)?.recipient,
+            amount_withheld: tax_amount,
+            tax_rate_bps: tax_vault.tax_rate_bps,
+            period_start: env.ledger().timestamp() - 86400, // 24 hour period
+            period_end: env.ledger().timestamp(),
+            receipt_timestamp: env.ledger().timestamp(),
+            receipt_hash: generate_tax_receipt_hash(env, grant_id, tax_amount, env.ledger().timestamp()),
+        };
+        
+        write_tax_receipt(env, receipt_id, &receipt);
+        write_next_tax_receipt_id(env, receipt_id + 1);
+        
+        // Emit tax receipt event
+        env.events().publish(
+            (symbol_short!("tax_receipt_issued"), grant_id),
+            (receipt_id, tax_amount, gross_amount, tax_vault.tax_rate_bps),
+        );
+        
+        Ok(())
+    }
+
+    /// Grantor withdraws from tax vault to pay government
+    pub fn withdraw_from_tax_vault(
+        env: Env,
+        grant_id: u64,
+        amount: i128,
+        grantor: Address,
+    ) -> Result<(), Error> {
+        grantor.require_auth();
+        
+        let mut tax_vault = env.storage().instance()
+            .get::<_, TaxVault>(&DataKey::TaxVault(grant_id))
+            .ok_or(Error::TaxVaultNotFound)?;
+        
+        let available_for_withdrawal = tax_vault.total_withheld - tax_vault.total_withdrawn_by_grantor;
+        
+        if amount > available_for_withdrawal || amount <= 0 {
+            return Err(Error::InsufficientTaxVault);
+        }
+        
+        tax_vault.total_withdrawn_by_grantor += amount;
+        env.storage().instance().set(&DataKey::TaxVault(grant_id), &tax_vault);
+        
+        // Transfer to grantor
+        let grant = read_grant(&env, grant_id)?;
+        let token_client = token::Client::new(&env, &grant.token_address);
+        token_client.transfer(&env.current_contract_address(), &grantor, &amount);
+        
+        env.events().publish(
+            (symbol_short!("tax_vault_withdraw"), grant_id),
+            (amount, grantor, tax_vault.total_withheld, tax_vault.total_withdrawn_by_grantor),
+        );
+        
+        Ok(())
+    }
+
+    /// Get tax vault information
+    pub fn get_tax_vault(env: Env, grant_id: u64) -> Result<TaxVault, Error> {
+        env.storage().instance()
+            .get(&DataKey::TaxVault(grant_id))
+            .ok_or(Error::TaxVaultNotFound)
+    }
+
+    /// Get tax receipt
+    pub fn get_tax_receipt(env: Env, receipt_id: u64) -> Result<TaxReceipt, Error> {
+        env.storage().instance()
+            .get(&DataKey::TaxReceipt(receipt_id))
+            .ok_or(Error::TaxReceiptAlreadyIssued)
+    }
+
+    // ========================================
+    // ISSUE #197: ON-CHAIN LEGAL ENTITY VERIFICATION HOOK
+    // ========================================
+
+    /// Set identity oracle contract (admin only)
+    pub fn set_identity_oracle(env: Env, oracle_address: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        env.storage().instance().set(&DataKey::IdentityOracleContract, &oracle_address);
+        
+        env.events().publish(
+            (symbol_short!("identity_oracle_set"),),
+            (oracle_address,),
+        );
+        
+        Ok(())
+    }
+
+    /// Verify legal entity for institutional grants
+    pub fn verify_legal_entity(
+        env: Env,
+        entity_address: Address,
+        entity_type: String,
+        jurisdiction: String,
+        registration_number: String,
+        expires_at: u64,
+    ) -> Result<LegalEntityVerification, Error> {
+        require_admin_auth(&env)?;
+        
+        let oracle_address = env.storage().instance()
+            .get::<_, Address>(&DataKey::IdentityOracleContract)
+            .ok_or(Error::IdentityOracleNotFound)?;
+        
+        // In a real implementation, this would call the identity oracle contract
+        // For now, we'll simulate the verification
+        let verification = LegalEntityVerification {
+            entity_address: entity_address.clone(),
+            entity_type: entity_type.clone(),
+            jurisdiction: jurisdiction.clone(),
+            registration_number: registration_number.clone(),
+            verified_at: env.ledger().timestamp(),
+            expires_at,
+            is_active: true,
+            identity_oracle: oracle_address,
+            verification_version: ENTITY_VERIFICATION_VERSION,
+        };
+        
+        env.storage().instance().set(&DataKey::LegalEntityVerification(entity_address.clone()), &verification);
+        
+        env.events().publish(
+            (symbol_short!("entity_verified"), entity_address),
+            (entity_type, jurisdiction, expires_at),
+        );
+        
+        Ok(verification)
+    }
+
+    /// Enable entity verification hook for a grant
+    pub fn enable_entity_verification_hook(
+        env: Env,
+        grant_id: u64,
+        entity_address: Address,
+        auto_pause_enabled: bool,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        // Verify entity is actually verified
+        let verification = env.storage().instance()
+            .get::<_, LegalEntityVerification>(&DataKey::LegalEntityVerification(entity_address.clone()))
+            .ok_or(Error::EntityNotVerified)?;
+        
+        if !verification.is_active || env.ledger().timestamp() > verification.expires_at {
+            return Err(Error::EntityVerificationExpired);
+        }
+        
+        let hook = EntityVerificationHook {
+            grant_id,
+            entity_address: entity_address.clone(),
+            last_check: env.ledger().timestamp(),
+            verification_status: true,
+            auto_pause_enabled,
+        };
+        
+        env.storage().instance().set(&DataKey::EntityVerificationHook(grant_id), &hook);
+        
+        env.events().publish(
+            (symbol_short!("entity_hook_enabled"), grant_id),
+            (entity_address, auto_pause_enabled),
+        );
+        
+        Ok(())
+    }
+
+    /// Check entity verification status and auto-pause if needed
+    pub fn check_entity_verification(
+        env: Env,
+        grant_id: u64,
+    ) -> Result<bool, Error> {
+        let mut hook = env.storage().instance()
+            .get::<_, EntityVerificationHook>(&DataKey::EntityVerificationHook(grant_id))
+            .ok_or(Error::EntityNotVerified)?;
+        
+        let verification = env.storage().instance()
+            .get::<_, LegalEntityVerification>(&DataKey::LegalEntityVerification(hook.entity_address.clone()))
+            .ok_or(Error::EntityNotVerified)?;
+        
+        let now = env.ledger().timestamp();
+        let is_still_valid = verification.is_active && now <= verification.expires_at;
+        
+        // Check if verification status changed
+        let status_changed = hook.verification_status != is_still_valid;
+        hook.verification_status = is_still_valid;
+        hook.last_check = now;
+        
+        // Auto-pause if verification expired/revoked and auto-pause is enabled
+        if !is_still_valid && hook.auto_pause_enabled && status_changed {
+            let mut grant = read_grant(&env, grant_id)?;
+            
+            if grant.status == GrantStatus::Active {
+                grant.status = GrantStatus::Paused;
+                write_grant(&env, grant_id, &grant);
+                
+                env.events().publish(
+                    (symbol_short!("entity_auto_paused"), grant_id),
+                    (hook.entity_address.clone(), verification.expires_at),
+                );
+            }
+        }
+        
+        env.storage().instance().set(&DataKey::EntityVerificationHook(grant_id), &hook);
+        
+        Ok(is_still_valid)
+    }
+
+    /// Revoke entity verification (oracle only)
+    pub fn revoke_entity_verification(
+        env: Env,
+        oracle_address: Address,
+        entity_address: Address,
+        reason: String,
+    ) -> Result<(), Error> {
+        let stored_oracle = env.storage().instance()
+            .get::<_, Address>(&DataKey::IdentityOracleContract)
+            .ok_or(Error::IdentityOracleNotFound)?;
+        
+        if oracle_address != stored_oracle {
+            return Err(Error::NotAuthorized);
+        }
+        
+        let mut verification = env.storage().instance()
+            .get::<_, LegalEntityVerification>(&DataKey::LegalEntityVerification(entity_address.clone()))
+            .ok_or(Error::EntityNotVerified)?;
+        
+        verification.is_active = false;
+        env.storage().instance().set(&DataKey::LegalEntityVerification(entity_address.clone()), &verification);
+        
+        // Check all grants with this entity and auto-pause if needed
+        let grant_ids = read_grant_ids(&env);
+        for grant_id in grant_ids.iter() {
+            if let Ok(hook) = env.storage().instance().get::<_, EntityVerificationHook>(&DataKey::EntityVerificationHook(*grant_id)) {
+                if hook.entity_address == entity_address && hook.auto_pause_enabled {
+                    let _ = Self::check_entity_verification(env.clone(), *grant_id);
+                }
+            }
+        }
+        
+        env.events().publish(
+            (symbol_short!("entity_revoked"), entity_address),
+            (reason, env.ledger().timestamp()),
+        );
+        
+        Ok(())
+    }
+
+    /// Get entity verification status
+    pub fn get_entity_verification(env: Env, entity_address: Address) -> Result<LegalEntityVerification, Error> {
+        env.storage().instance()
+            .get(&DataKey::LegalEntityVerification(entity_address))
+            .ok_or(Error::EntityNotVerified)
+    }
+
+    /// Get entity verification hook for a grant
+    pub fn get_entity_verification_hook(env: Env, grant_id: u64) -> Result<EntityVerificationHook, Error> {
+        env.storage().instance()
+            .get(&DataKey::EntityVerificationHook(grant_id))
+            .ok_or(Error::EntityNotVerified)
+    }
+
+    // ========================================
+    // ISSUE #195: FLASH LOAN PROVIDER FOR DAO TREASURIES
+    // ========================================
+
+    /// Initialize flash loan provider (admin only)
+    pub fn initialize_flash_loan_provider(
+        env: Env,
+        treasury_address: Address,
+        max_concurrent_loans: u32,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        if max_concurrent_loans == 0 || max_concurrent_loans > 100 {
+            return Err(Error::InvalidAmount);
+        }
+        
+        let provider = FlashLoanProvider {
+            treasury_address: treasury_address.clone(),
+            total_loans_issued: 0,
+            total_fees_earned: 0,
+            active_loans: 0,
+            max_concurrent_loans,
+            provider_enabled: true,
+        };
+        
+        env.storage().instance().set(&DataKey::FlashLoanProvider, &provider);
+        env.storage().instance().set(&DataKey::NextFlashLoanId, &1u64);
+        env.storage().instance().set(&DataKey::ActiveFlashLoans, &0u64);
+        
+        env.events().publish(
+            (symbol_short!("flash_loan_provider_init"),),
+            (treasury_address, max_concurrent_loans),
+        );
+        
+        Ok(())
+    }
+
+    /// Execute flash loan - atomic borrowing with same-transaction repayment
+    pub fn execute_flash_loan(
+        env: Env,
+        borrower: Address,
+        amount: i128,
+        asset_address: Address,
+        callback_contract: Address,
+        callback_function: Symbol,
+        callback_data: soroban_sdk::Val,
+    ) -> Result<FlashLoan, Error> {
+        borrower.require_auth();
+        
+        // Validate amount
+        if amount < MIN_FLASH_LOAN_AMOUNT || amount > MAX_FLASH_LOAN_AMOUNT {
+            return Err(Error::FlashLoanAmountTooSmall);
+        }
+        
+        // Check provider is enabled
+        let mut provider = env.storage().instance()
+            .get::<_, FlashLoanProvider>(&DataKey::FlashLoanProvider)
+            .ok_or(Error::NotInitialized)?;
+        
+        if !provider.provider_enabled {
+            return Err(Error::NotInitialized);
+        }
+        
+        // Check concurrent loan limit
+        let active_loans = env.storage().instance()
+            .get::<_, u64>(&DataKey::ActiveFlashLoans)
+            .unwrap_or(0);
+        
+        if active_loans >= provider.max_concurrent_loans as u64 {
+            return Err(Error::FlashLoanInProgress);
+        }
+        
+        // Calculate fee
+        let fee = (amount * FLASH_LOAN_FEE_BPS as i128) / 10000;
+        let total_repayment = amount + fee;
+        
+        // Get loan ID
+        let loan_id = read_next_flash_loan_id(&env);
+        
+        // Create flash loan record
+        let loan = FlashLoan {
+            loan_id,
+            borrower: borrower.clone(),
+            amount,
+            fee,
+            asset_address: asset_address.clone(),
+            started_at: env.ledger().timestamp(),
+            repaid_at: None,
+            is_active: true,
+        };
+        
+        // Store loan and update counters
+        write_flash_loan(&env, loan_id, &loan);
+        write_next_flash_loan_id(&env, loan_id + 1);
+        
+        provider.total_loans_issued += 1;
+        provider.active_loans += 1;
+        env.storage().instance().set(&DataKey::FlashLoanProvider, &provider);
+        env.storage().instance().set(&DataKey::ActiveFlashLoans, &provider.active_loans);
+        
+        // Get treasury balance before transfer
+        let token_client = token::Client::new(&env, &asset_address);
+        let treasury_balance_before = token_client.balance(&provider.treasury_address);
+        
+        // Transfer funds to borrower
+        token_client.transfer(&provider.treasury_address, &borrower, &amount);
+        
+        // Execute borrower's callback contract
+        let callback_args = (borrower.clone(), amount, fee, callback_data).into_val(&env);
+        let callback_result = env.try_invoke_contract::<soroban_sdk::Val, soroban_sdk::Error>(
+            &callback_contract,
+            &callback_function,
+            callback_args,
+        );
+        
+        // Check if callback succeeded
+        if callback_result.is_err() {
+            // Callback failed - revert the loan
+            Self::revert_flash_loan(&env, loan_id, &provider, &asset_address, &borrower, amount)?;
+            return Err(Error::FlashLoanNotRepaid);
+        }
+        
+        // Check repayment
+        let treasury_balance_after = token_client.balance(&provider.treasury_address);
+        let actual_repayment = treasury_balance_after - treasury_balance_before;
+        
+        if actual_repayment < total_repayment {
+            // Insufficient repayment - revert the loan
+            Self::revert_flash_loan(&env, loan_id, &provider, &asset_address, &borrower, amount)?;
+            return Err(Error::FlashLoanFeeNotPaid);
+        }
+        
+        // Mark loan as repaid
+        let mut completed_loan = loan;
+        completed_loan.repaid_at = Some(env.ledger().timestamp());
+        completed_loan.is_active = false;
+        write_flash_loan(&env, loan_id, &completed_loan);
+        
+        // Update provider stats
+        provider.active_loans -= 1;
+        provider.total_fees_earned += fee;
+        env.storage().instance().set(&DataKey::FlashLoanProvider, &provider);
+        env.storage().instance().set(&DataKey::ActiveFlashLoans, &provider.active_loans);
+        
+        // Emit success event
+        env.events().publish(
+            (symbol_short!("flash_loan_completed"), loan_id),
+            (borrower, amount, fee, asset_address),
+        );
+        
+        Ok(completed_loan)
+    }
+
+    /// Revert flash loan on failure (internal function)
+    fn revert_flash_loan(
+        env: &Env,
+        loan_id: u64,
+        provider: &FlashLoanProvider,
+        asset_address: &Address,
+        borrower: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        // Try to recover funds from borrower
+        let token_client = token::Client::new(env, asset_address);
+        let borrower_balance = token_client.balance(borrower);
+        
+        let recover_amount = if borrower_balance >= amount {
+            amount
+        } else {
+            borrower_balance
+        };
+        
+        if recover_amount > 0 {
+            token_client.transfer(borrower, &provider.treasury_address, &recover_amount);
+        }
+        
+        // Mark loan as failed
+        let mut failed_loan = read_flash_loan(env, loan_id)?;
+        failed_loan.is_active = false;
+        failed_loan.repaid_at = Some(env.ledger().timestamp());
+        write_flash_loan(env, loan_id, &failed_loan);
+        
+        // Update provider stats
+        let mut updated_provider = *provider;
+        updated_provider.active_loans -= 1;
+        env.storage().instance().set(&DataKey::FlashLoanProvider, &updated_provider);
+        env.storage().instance().set(&DataKey::ActiveFlashLoans, &updated_provider.active_loans);
+        
+        // Emit failure event
+        env.events().publish(
+            (symbol_short!("flash_loan_failed"), loan_id),
+            (borrower.clone(), amount, recover_amount),
+        );
+        
+        Ok(())
+    }
+
+    /// Enable/disable flash loan provider (admin only)
+    pub fn set_flash_loan_provider_enabled(env: Env, enabled: bool) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        let mut provider = env.storage().instance()
+            .get::<_, FlashLoanProvider>(&DataKey::FlashLoanProvider)
+            .ok_or(Error::NotInitialized)?;
+        
+        provider.provider_enabled = enabled;
+        env.storage().instance().set(&DataKey::FlashLoanProvider, &provider);
+        
+        env.events().publish(
+            (symbol_short!("flash_loan_provider_status"),),
+            (enabled,),
+        );
+        
+        Ok(())
+    }
+
+    /// Get flash loan provider information
+    pub fn get_flash_loan_provider(env: Env) -> Result<FlashLoanProvider, Error> {
+        env.storage().instance()
+            .get(&DataKey::FlashLoanProvider)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// Get flash loan information
+    pub fn get_flash_loan(env: Env, loan_id: u64) -> Result<FlashLoan, Error> {
+        read_flash_loan(&env, loan_id)
+    }
 }
 
 fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
@@ -5051,6 +6069,80 @@ fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i
         &Symbol::new(env, "on_withdraw"),
         args,
     );
+}
+
+// ========================================
+// HELPER FUNCTIONS FOR NEW FEATURES
+// ========================================
+
+// Issue #200: Clawback-Compatible Regulated Asset Handler helpers
+fn read_next_balance_sync_id(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::NextBalanceSyncId)
+        .unwrap_or(1)
+}
+
+fn write_next_balance_sync_id(env: &Env, sync_id: u64) {
+    env.storage().instance().set(&DataKey::NextBalanceSyncId, &sync_id);
+}
+
+fn write_balance_sync_record(env: &Env, sync_id: u64, record: &BalanceSyncRecord) {
+    env.storage().instance().set(&DataKey::BalanceSyncRecord(sync_id), record);
+}
+
+// Issue #199: Tax Withholding Escrow helpers
+fn read_next_tax_receipt_id(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::NextTaxReceiptId)
+        .unwrap_or(1)
+}
+
+fn write_next_tax_receipt_id(env: &Env, receipt_id: u64) {
+    env.storage().instance().set(&DataKey::NextTaxReceiptId, &receipt_id);
+}
+
+fn write_tax_receipt(env: &Env, receipt_id: u64, receipt: &TaxReceipt) {
+    env.storage().instance().set(&DataKey::TaxReceipt(receipt_id), receipt);
+}
+
+fn generate_tax_receipt_hash(env: &Env, grant_id: u64, amount: i128, timestamp: u64) -> [u8; 32] {
+    let mut hasher = [0u8; 32];
+    
+    let combined = format!(
+        "{}:{}:{}:{}",
+        grant_id, amount, timestamp, TAX_VAULT_VERSION
+    );
+    
+    // Simple hash implementation for demonstration
+    for i in 0..32.min(combined.len()) {
+        hasher[i] = combined.as_bytes()[i];
+    }
+    
+    hasher
+}
+
+// Issue #195: Flash Loan Provider helpers
+fn read_next_flash_loan_id(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::NextFlashLoanId)
+        .unwrap_or(1)
+}
+
+fn write_next_flash_loan_id(env: &Env, loan_id: u64) {
+    env.storage().instance().set(&DataKey::NextFlashLoanId, &loan_id);
+}
+
+fn write_flash_loan(env: &Env, loan_id: u64, loan: &FlashLoan) {
+    env.storage().instance().set(&DataKey::FlashLoan(loan_id), loan);
+}
+
+fn read_flash_loan(env: &Env, loan_id: u64) -> Result<FlashLoan, Error> {
+    env.storage().instance()
+        .get(&DataKey::FlashLoan(loan_id))
+        .ok_or(Error::GrantNotFound)
 }
 
 #[cfg(test)]
