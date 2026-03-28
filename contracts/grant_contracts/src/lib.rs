@@ -94,8 +94,8 @@ pub mod sub_dao_authority;
 pub mod grant_appeals;
 pub mod wasm_hash_verification;
 pub mod cross_chain_metadata;
-pub mod recursive_funding;
-pub mod interest_redirection;
+pub mod temporal_guard;
+pub mod yield_reserve;
 
 // --- Test Modules ---
 #[cfg(test)]
@@ -948,6 +948,9 @@ pub enum GrantError {
     InvalidGrantee,
     InvalidStreamConfig,
     InvalidAccelerationConfig,
+    InsufficientLiquidity,
+    InvalidAllocation,
+    YieldHarvestFailed,
 }
 
 #[derive(Clone, Debug)]
@@ -2121,7 +2124,7 @@ impl GrantContract {
         Ok(())
     }
 
-    /// Task #194: Stellar DEX Direct-to-Grantee Path Payment Hook
+    /// Task rgb(57, 158, 96): Stellar DEX Direct-to-Grantee Path Payment Hook
     /// Withdrawals automatically swapped on the Stellar DEX for preferred builder currency.
     pub fn swap_and_withdraw(
         env: Env,

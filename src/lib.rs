@@ -19,8 +19,8 @@ pub struct Grant {
 pub struct SubStream {
     pub creator: Address,
     pub subscriber: Address,
-    pub flow_rate: i128,           // tokens per second
-    pub balance: i128,             // available revenue
+    pub flow_rate: i128,
+    pub balance: i128,
     pub last_claim_time: u64,
     pub is_active: bool,
 }
@@ -28,7 +28,7 @@ pub struct SubStream {
 #[contracttype]
 pub enum DataKey {
     Grant(u64),
-    SubStream(u64),                // New: SubStream storage
+    SubStream(u64),
     GrantCount,
     SubStreamCount,
     Arbiter,
@@ -39,8 +39,6 @@ pub struct GrantContract;
 
 #[contractimpl]
 impl GrantContract {
-    // ────────────────────────────────────────────────
-    // Storage TTL optimization (from previous work)
     fn ensure_sufficient_ttl(env: &Env) {
         const THRESHOLD: u32 = 1000;
         let max_ttl = env.storage().max_ttl();
@@ -59,28 +57,27 @@ impl GrantContract {
             .get(&DataKey::SubStream(substream_id))
             .unwrap_or_else(|| panic!("SubStream not found"));
 
-        // Only the grant admin or grantee can initiate the bridge
-        if !grant.admin == env.invoker() && !grant.grantee == env.invoker() {
-            panic!("Unauthorized");
+        // Authorization: Only admin or grantee can bridge
+        if env.invoker() != grant.admin && env.invoker() != grant.grantee {
+            panic!("Unauthorized: only admin or grantee can bridge SubStream");
         }
 
-        // Query available revenue from SubStream
-        if substream.balance <= 0 || !substream.is_active {
+        // Check SubStream is active and has balance
+        if !substream.is_active || substream.balance <= 0 {
             panic!("Insufficient or inactive SubStream balance");
         }
 
-        // Use SubStream balance as collateral (reduce required upfront stake)
+        // Use SubStream balance as collateral
         grant.balance += substream.balance;
 
         env.storage().instance().set(&DataKey::Grant(grant_id), &grant);
 
-        // Optional: Emit event
+        // Optional: emit event
         // env.events().publish(("SubStreamBridged", grant_id, substream_id), substream.balance);
 
         true
     }
 
-    // Existing functions (cleaned slightly)
     pub fn set_arbiter(env: Env, admin: Address, arbiter: Address) {
         Self::ensure_sufficient_ttl(&env);
         admin.require_auth();
@@ -171,7 +168,7 @@ impl GrantContract {
 }
 
 // ────────────────────────────────────────────────
-// SubStream Contract (New)
+// SubStream Contract
 // ────────────────────────────────────────────────
 
 #[contract]
@@ -186,7 +183,7 @@ impl SubStreamContract {
         flow_rate: i128,
         token: Address,
     ) -> u64 {
-        Self::ensure_sufficient_ttl(&env);   // reuse helper if you move it to lib
+        Self::ensure_sufficient_ttl(&env);
 
         creator.require_auth();
 
@@ -207,11 +204,9 @@ impl SubStreamContract {
 
         count
     }
-
-    // Add more SubStream logic as needed (claim, pause, etc.)
 }
 
-// Helper for TTL (shared)
+// Shared helper
 fn ensure_sufficient_ttl(env: &Env) {
     const THRESHOLD: u32 = 1000;
     let max_ttl = env.storage().max_ttl();
