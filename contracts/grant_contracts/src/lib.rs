@@ -95,7 +95,7 @@ pub mod grant_appeals;
 pub mod wasm_hash_verification;
 pub mod cross_chain_metadata;
 pub mod recursive_funding;
-pub mod temporal_guard;
+pub mod interest_redirection;
 
 // --- Test Modules ---
 #[cfg(test)]
@@ -5961,6 +5961,6 @@ mod test_yield;
 #[cfg(test)]
 mod test_fee;
 #[cfg(test)]
-mod test_recursive_funding;
+mod test_interest_redirection;
 #[cfg(test)]
 
