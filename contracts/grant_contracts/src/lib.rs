@@ -99,8 +99,8 @@ pub mod sub_dao_authority;
 pub mod grant_appeals;
 pub mod wasm_hash_verification;
 pub mod cross_chain_metadata;
-pub mod temporal_guard;
 pub mod yield_reserve;
+pub mod cleanup_bounty;
 
 // --- Test Modules ---
 #[cfg(test)]
