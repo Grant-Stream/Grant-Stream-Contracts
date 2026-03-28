@@ -94,7 +94,7 @@ pub mod sub_dao_authority;
 pub mod grant_appeals;
 pub mod wasm_hash_verification;
 pub mod cross_chain_metadata;
-pub mod temporal_guard;
+pub mod liquidity_provision_hook;
 
 // --- Test Modules ---
 #[cfg(test)]
@@ -5959,5 +5959,7 @@ mod test_inflation;
 mod test_yield;
 #[cfg(test)]
 mod test_fee;
+#[cfg(test)]
+mod test_liquidity_provision;
 #[cfg(test)]
 
