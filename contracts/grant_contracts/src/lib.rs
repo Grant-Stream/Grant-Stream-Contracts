@@ -94,6 +94,7 @@ pub mod sub_dao_authority;
 pub mod grant_appeals;
 pub mod wasm_hash_verification;
 pub mod cross_chain_metadata;
+pub mod recursive_funding;
 pub mod temporal_guard;
 
 // --- Test Modules ---
@@ -5959,5 +5960,7 @@ mod test_inflation;
 mod test_yield;
 #[cfg(test)]
 mod test_fee;
+#[cfg(test)]
+mod test_recursive_funding;
 #[cfg(test)]
 
