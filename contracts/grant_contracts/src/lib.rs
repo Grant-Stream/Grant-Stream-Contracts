@@ -114,6 +114,8 @@ mod test_pause_cooldown;
 mod test_grant_appeals;
 #[cfg(test)]
 mod test_stream_nft;
+#[cfg(test)]
+mod test_clawback_health_check;
 /// Get the next available grant ID
 ///
 /// This function finds the next unused grant ID by checking existing grants.
@@ -385,6 +387,7 @@ pub enum GrantStatus {
     DisputeRaised,
     ArbitrationPending,
     ArbitrationResolved,
+    SafetyPaused, // Issue #200: Clawback health check safety pause
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -549,6 +552,12 @@ pub struct Grant {
     // Gas buffer fields for fail-safe withdrawals
     pub gas_buffer: i128, // Pre-paid XLM buffer for high network fee periods
     pub gas_buffer_used: i128, // Amount of gas buffer used so far
+    
+    // Issue #200: Clawback Health Check fields
+    pub deficit_detected: bool, // Whether a deficit has been detected
+    pub deficit_amount: i128, // Amount of deficit if detected
+    pub last_balance_check: u64, // Last time balance was verified
+    pub safety_pause_start: Option<u64>, // When safety pause started
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -801,6 +810,31 @@ pub struct BalanceSyncRecord {
     pub streams_affected: u32,
 }
 
+// Issue #200: Deficit Detection and Safety Pause structures
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct DeficitRecord {
+    pub grant_id: u64,
+    pub expected_balance: i128,  // Total owed (withdrawn + claimable + validator amounts)
+    pub actual_balance: i128,     // Actual contract balance
+    pub deficit_amount: i128,     // Shortfall amount
+    pub detected_at: u64,         // When deficit was detected
+    pub safety_pause_active: bool, // Whether safety pause is enabled
+    pub resolved: bool,           // Whether deficit has been resolved
+    pub resolution_timestamp: Option<u64>, // When deficit was resolved
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct ClawbackBuffer {
+    pub grant_id: u64,
+    pub buffered_amount: i128,
+    pub buffer_start_time: u64,
+    pub buffer_duration: u64,      // 4 hours = 14400 seconds
+    pub recipients: Vec<Address>,  // Affected recipients
+    pub released: bool,            // Whether buffer has been released
+}
+
 // Issue #199: Tax Withholding Escrow structures
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -1039,8 +1073,13 @@ pub enum DataKey {
     AmendmentIds,                // List of all amendment IDs
     AmendmentAppeal(u64),         // Maps appeal_id to appeal details
     NextAppealId,                // Next available appeal ID
-
-
+    
+    // Issue #200: Clawback Health Check keys
+    DeficitRecord(u64),          // Maps grant_id to deficit record
+    ClawbackBuffer(u64),         // Maps grant_id to clawback buffer
+    RegulatedAssetInfo(Address), // Maps asset address to regulated asset info
+    BalanceSyncRecords(u64),     // Maps grant_id to list of balance sync records
+    SafetyPauseActive,           // Global safety pause flag
 
 #[contracterror]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
@@ -1086,6 +1125,12 @@ pub enum Error {
     NoStakeToSlash = 34,
     PauseCooldownActive = 63,
     InsufficientSuperMajority = 64,
+    
+    // Clawback Health Check errors (Issue #200)
+    DeficitDetected = 300,
+    SafetyPauseActive = 301,
+    BalanceSyncRequired = 302,
+    RegulatedAssetRestriction = 303,
 
 }
 
@@ -1679,6 +1724,259 @@ fn calculate_accrued(grant: &Grant, elapsed: u64, now: u64) -> Result<i128, Erro
     Ok(accrued)
 }
 
+// --- Issue #200: Clawback Health Check Helper Functions ---
+
+/// Perform clawback health check before withdrawal
+/// Verifies contract balance matches expected total owed
+fn perform_clawback_health_check(
+    env: &Env,
+    grant_id: u64,
+    grant: &mut Grant,
+) -> Result<(), Error> {
+    let now = env.ledger().timestamp();
+    
+    // Skip check if performed recently (within 1 hour)
+    if now - grant.last_balance_check < 3600 {
+        return Ok(());
+    }
+    
+    // Get actual contract balance for this token
+    let token_client = token::Client::new(env, &grant.token_address);
+    let actual_balance = token_client.balance(&env.current_contract_address());
+    
+    // Calculate expected balance (total owed)
+    let expected_balance = grant.withdrawn
+        .checked_add(grant.claimable)
+        .ok_or(Error::MathOverflow)?
+        .checked_add(grant.validator_withdrawn)
+        .ok_or(Error::MathOverflow)?
+        .checked_add(grant.validator_claimable)
+        .ok_or(Error::MathOverflow)?;
+    
+    // Update last balance check time
+    grant.last_balance_check = now;
+    
+    // Check for deficit
+    if actual_balance < expected_balance {
+        let deficit_amount = expected_balance - actual_balance;
+        
+        // Emit DeficitDetected event
+        env.events().publish(
+            (symbol_short!("deficit_detected"), grant_id),
+            (
+                expected_balance,
+                actual_balance,
+                deficit_amount,
+                grant.recipient.clone(),
+            ),
+        );
+        
+        // Record deficit
+        let deficit_record = DeficitRecord {
+            grant_id,
+            expected_balance,
+            actual_balance,
+            deficit_amount,
+            detected_at: now,
+            safety_pause_active: true,
+            resolved: false,
+            resolution_timestamp: None,
+        };
+        
+        env.storage().instance().set(&DataKey::DeficitRecord(grant_id), &deficit_record);
+        
+        // Update grant state
+        grant.deficit_detected = true;
+        grant.deficit_amount = deficit_amount;
+        grant.status = GrantStatus::SafetyPaused;
+        grant.safety_pause_start = Some(now);
+        
+        // Create clawback buffer to prevent race conditions
+        let mut affected_recipients = Vec::new(env);
+        affected_recipients.push_back(grant.recipient.clone());
+        if let Some(validator) = &grant.validator {
+            affected_recipients.push_back(validator.clone());
+        }
+        
+        let clawback_buffer = ClawbackBuffer {
+            grant_id,
+            buffered_amount: actual_balance,
+            buffer_start_time: now,
+            buffer_duration: 14400, // 4 hours
+            recipients: affected_recipients,
+            released: false,
+        };
+        
+        env.storage().instance().set(&DataKey::ClawbackBuffer(grant_id), &clawback_buffer);
+        
+        // Return error to block withdrawal during deficit
+        return Err(Error::DeficitDetected);
+    }
+    
+    // No deficit - clear any previous deficit flags
+    if grant.deficit_detected {
+        grant.deficit_detected = false;
+        grant.deficit_amount = 0;
+    }
+    
+    Ok(())
+}
+
+/// Withdraw proportional share during safety pause
+/// Ensures fair distribution when contract balance is insufficient
+fn withdraw_proportional_during_safety_pause(
+    env: Env,
+    grant_id: u64,
+    amount: i128,
+    grant: &mut Grant,
+) -> Result<(), Error> {
+    // Verify safety pause is active
+    if grant.status != GrantStatus::SafetyPaused {
+        return Err(Error::InvalidState);
+    }
+    
+    // Get clawback buffer
+    let mut buffer: ClawbackBuffer = env
+        .storage()
+        .instance()
+        .get(&DataKey::ClawbackBuffer(grant_id))
+        .ok_or(Error::InsufficientReserve)?;
+    
+    // Check if buffer period has expired (4 hours)
+    let now = env.ledger().timestamp();
+    if now >= buffer.buffer_start_time + buffer.buffer_duration {
+        // Buffer period expired - release remaining funds proportionally
+        buffer.released = true;
+        env.storage().instance().set(&DataKey::ClawbackBuffer(grant_id), &buffer);
+        
+        // Calculate proportional share
+        let total_owed = grant.withdrawn
+            .checked_add(grant.claimable)
+            .ok_or(Error::MathOverflow)?;
+        
+        if total_owed == 0 {
+            return Err(Error::InvalidAmount);
+        }
+        
+        // Get actual balance
+        let token_client = token::Client::new(&env, &grant.token_address);
+        let available_balance = token_client.balance(&env.current_contract_address());
+        
+        // Calculate proportional amount
+        let proportional_amount = (amount
+            .checked_mul(available_balance as i128)
+            .ok_or(Error::MathOverflow)?)
+            .checked_div(total_owed)
+            .ok_or(Error::MathOverflow)?;
+        
+        if proportional_amount <= 0 || proportional_amount > available_balance as i128 {
+            return Err(Error::InvalidAmount);
+        }
+        
+        // Process proportional withdrawal
+        grant.claimable = grant.claimable.checked_sub(proportional_amount).ok_or(Error::InvalidAmount)?;
+        grant.withdrawn = grant.withdrawn.checked_add(proportional_amount).ok_or(Error::MathOverflow)?;
+        
+        token_client.transfer(&env.current_contract_address(), &grant.recipient, &proportional_amount);
+        
+        write_grant(&env, grant_id, grant);
+        
+        env.events().publish(
+            (symbol_short!("safety_pause_withdraw"), grant_id),
+            (proportional_amount, amount, available_balance, total_owed),
+        );
+        
+        return Ok(());
+    }
+    
+    // Buffer still active - allow withdrawal only from buffered amount
+    let recipient_share = (amount
+        .checked_mul(buffer.buffered_amount as i128)
+        .ok_or(Error::MathOverflow)?)
+        .checked_div(grant.total_amount as i128)
+        .ok_or(Error::MathOverflow)?;
+    
+    if recipient_share <= 0 {
+        return Err(Error::InvalidAmount);
+    }
+    
+    // Process withdrawal from buffer
+    grant.claimable = grant.claimable.checked_sub(recipient_share).ok_or(Error::InvalidAmount)?;
+    grant.withdrawn = grant.withdrawn.checked_add(recipient_share).ok_or(Error::MathOverflow)?;
+    buffer.buffered_amount = buffer.buffered_amount.checked_sub(recipient_share as i128).ok_or(Error::MathOverflow)?;
+    
+    let token_client = token::Client::new(&env, &grant.token_address);
+    token_client.transfer(&env.current_contract_address(), &grant.recipient, &recipient_share);
+    
+    env.storage().instance().set(&DataKey::ClawbackBuffer(grant_id), &buffer);
+    write_grant(&env, grant_id, grant);
+    
+    env.events().publish(
+        (symbol_short!("buffer_withdrawal"), grant_id),
+        (recipient_share, buffer.buffered_amount),
+    );
+    
+    Ok(())
+}
+
+/// Resolve deficit by admin adding funds or adjusting grant terms
+fn resolve_deficit(
+    env: &Env,
+    grant_id: u64,
+    new_funds_added: i128,
+) -> Result<(), Error> {
+    require_admin_auth(env)?;
+    
+    let mut grant = read_grant(env, grant_id)?;
+    
+    if !grant.deficit_detected {
+        return Err(Error::InvalidState);
+    }
+    
+    let mut deficit_record: DeficitRecord = env
+        .storage()
+        .instance()
+        .get(&DataKey::DeficitRecord(grant_id))
+        .ok_or(Error::DeficitDetected)?;
+    
+    // Add new funds to grant
+    if new_funds_added > 0 {
+        let token_client = token::Client::new(env, &grant.token_address);
+        let treasury = read_treasury(env)?;
+        token_client.transfer(&treasury, &env.current_contract_address(), &new_funds_added);
+        
+        // Update deficit record
+        deficit_record.actual_balance = deficit_record.actual_balance.checked_add(new_funds_added).ok_or(Error::MathOverflow)?;
+        deficit_record.deficit_amount = deficit_record.deficit_amount.checked_sub(new_funds_added).ok_or(Error::MathOverflow)?;
+    }
+    
+    // Check if deficit is fully resolved
+    if deficit_record.deficit_amount <= 0 {
+        deficit_record.resolved = true;
+        deficit_record.resolution_timestamp = Some(env.ledger().timestamp());
+        
+        // Update grant state
+        grant.deficit_detected = false;
+        grant.deficit_amount = 0;
+        grant.status = GrantStatus::Active;
+        grant.safety_pause_start = None;
+        
+        // Remove clawback buffer
+        env.storage().instance().remove(&DataKey::ClawbackBuffer(grant_id));
+        
+        env.events().publish(
+            (symbol_short!("deficit_resolved"), grant_id),
+            (new_funds_added, grant.recipient.clone()),
+        );
+    }
+    
+    // Save updated records
+    env.storage().instance().set(&DataKey::DeficitRecord(grant_id), &deficit_record);
+    write_grant(env, grant_id, &grant);
+    
+    Ok(())
+}
+
 // --- Contract Implementation ---
 
 #[contract]
@@ -1762,16 +2060,27 @@ impl GrantContract {
     /// 
     /// Enhanced with Task #183: Cross-Contract Flash Loan Protection
     /// Prevents voting and withdrawal in the same ledger to stop atomic exploits.
+    /// 
+    /// Issue #200: Clawback Health Check
+    /// Verifies contract balance before withdrawal and triggers safety pause if deficit detected.
     pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
         let mut grant = read_grant(&env, grant_id)?;
         grant.recipient.require_auth();
 
         if grant.status != GrantStatus::Active {
+            // Check if safety paused - still allow proportional withdrawals
+            if grant.status == GrantStatus::SafetyPaused {
+                // Allow withdrawals only proportionally based on remaining funds
+                return Self::withdraw_proportional_during_safety_pause(env, grant_id, amount, &mut grant);
+            }
             return Err(Error::InvalidState);
         }
 
         // Task #183: Check temporal guard protection before withdrawal
         check_withdrawal_temporal_guard(&env, &grant.recipient, grant_id)?;
+
+        // Issue #200: Perform clawback health check before withdrawal
+        Self::perform_clawback_health_check(&env, grant_id, &mut grant)?;
 
         // Settle accruals
         // settle_grant_internal_logic_call(&mut grant, env.ledger().timestamp())?;
@@ -2867,6 +3176,142 @@ impl GrantContract {
 
         client.transfer(&env.current_contract_address(), &to, &amount);
         Ok(())
+    }
+
+    /// Issue #200: Resolve deficit by adding funds to grant
+    /// Admin can transfer tokens from treasury to cover clawback shortfall
+    pub fn resolve_deficit_with_treasury_funds(
+        env: Env,
+        grant_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        let mut grant = read_grant(&env, grant_id)?;
+        
+        if !grant.deficit_detected {
+            return Err(Error::InvalidState);
+        }
+        
+        let mut deficit_record: DeficitRecord = env
+            .storage()
+            .instance()
+            .get(&DataKey::DeficitRecord(grant_id))
+            .ok_or(Error::DeficitDetected)?;
+        
+        // Transfer funds from treasury
+        let token_client = token::Client::new(&env, &grant.token_address);
+        let treasury = read_treasury(&env)?;
+        token_client.transfer(&treasury, &env.current_contract_address(), &amount);
+        
+        // Update deficit record
+        deficit_record.actual_balance = deficit_record.actual_balance.checked_add(amount).ok_or(Error::MathOverflow)?;
+        deficit_record.deficit_amount = deficit_record.deficit_amount.checked_sub(amount).ok_or(Error::MathOverflow)?;
+        
+        // Check if deficit is fully resolved
+        if deficit_record.deficit_amount <= 0 {
+            deficit_record.resolved = true;
+            deficit_record.resolution_timestamp = Some(env.ledger().timestamp());
+            
+            // Update grant state
+            grant.deficit_detected = false;
+            grant.deficit_amount = 0;
+            grant.status = GrantStatus::Active;
+            grant.safety_pause_start = None;
+            
+            // Remove clawback buffer
+            env.storage().instance().remove(&DataKey::ClawbackBuffer(grant_id));
+            
+            env.events().publish(
+                (symbol_short!("deficit_resolved"), grant_id),
+                (amount, treasury, grant.recipient.clone()),
+            );
+        } else {
+            // Partial resolution - update record but keep safety pause active
+            env.events().publish(
+                (symbol_short!("deficit_partial_resolve"), grant_id),
+                (amount, deficit_record.deficit_amount),
+            );
+        }
+        
+        // Save updated records
+        env.storage().instance().set(&DataKey::DeficitRecord(grant_id), &deficit_record);
+        write_grant(&env, grant_id, &grant);
+        
+        Ok(())
+    }
+
+    /// Issue #200: Manually trigger safety pause for a grant
+    /// Admin can activate safety pause if external clawback is suspected
+    pub fn activate_safety_pause(env: Env, grant_id: u64) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        let mut grant = read_grant(&env, grant_id)?;
+        
+        if grant.status == GrantStatus::SafetyPaused {
+            return Err(Error::InvalidState);
+        }
+        
+        let now = env.ledger().timestamp();
+        grant.status = GrantStatus::SafetyPaused;
+        grant.safety_pause_start = Some(now);
+        
+        write_grant(&env, grant_id, &grant);
+        
+        env.events().publish(
+            (symbol_short!("safety_pause_activated"), grant_id),
+            (now, grant.recipient.clone()),
+        );
+        
+        Ok(())
+    }
+
+    /// Issue #200: Deactivate safety pause after audit confirms no clawback
+    /// Admin can resume normal operations if deficit was false positive
+    pub fn deactivate_safety_pause(env: Env, grant_id: u64) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        let mut grant = read_grant(&env, grant_id)?;
+        
+        if grant.status != GrantStatus::SafetyPaused {
+            return Err(Error::InvalidState);
+        }
+        
+        // Verify clawback buffer has been released or expired
+        if let Some(buffer): ClawbackBuffer = env.storage().instance().get(&DataKey::ClawbackBuffer(grant_id)) {
+            let now = env.ledger().timestamp();
+            if !buffer.released && now < buffer.buffer_start_time + buffer.buffer_duration {
+                return Err(Error::InvalidState); // Buffer still active, wait for release
+            }
+        }
+        
+        grant.status = GrantStatus::Active;
+        grant.safety_pause_start = None;
+        
+        write_grant(&env, grant_id, &grant);
+        
+        env.events().publish(
+            (symbol_short!("safety_pause_deactivated"), grant_id),
+            (env.ledger().timestamp(), grant.recipient.clone()),
+        );
+        
+        Ok(())
+    }
+
+    /// Issue #200: Get deficit record for a grant
+    pub fn get_deficit_record(env: Env, grant_id: u64) -> Result<DeficitRecord, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::DeficitRecord(grant_id))
+            .ok_or(Error::DeficitDetected)
+    }
+
+    /// Issue #200: Get clawback buffer info for a grant
+    pub fn get_clawback_buffer(env: Env, grant_id: u64) -> Result<ClawbackBuffer, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ClawbackBuffer(grant_id))
+            .ok_or(Error::InsufficientReserve)
     }
 
     pub fn cancel_grant(env: Env, grant_id: Symbol) {
