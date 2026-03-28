@@ -41,6 +41,11 @@ const MAX_SLASHING_REASON_LENGTH: u32 = 500; // Maximum reason string length
 const PAUSE_COOLDOWN_PERIOD: u64 = 14 * 24 * 60 * 60; // 14 days in seconds
 const SUPER_MAJORITY_THRESHOLD: u32 = 7500; // 75% super-majority threshold (in basis points)
 
+// Issue #102: Oracle Safety Valve constants
+const ORACLE_HEARTBEAT_TIMEOUT_SECS: u64 = 48 * 60 * 60; // 48 hours
+const SAFETY_VOTE_DURATION_SECS: u64 = 7 * 24 * 60 * 60; // 7 days voting window
+const SAFETY_APPROVAL_THRESHOLD: u32 = 9000; // 90% supermajority (in basis points)
+
 // Gas Buffer constants
 const DEFAULT_GAS_BUFFER: i128 = 1_000_000; // 0.1 XLM default gas buffer (in stroops)
 const HIGH_NETWORK_FEE_THRESHOLD: i128 = 100_000; // 0.01 XLM threshold for high network fees
@@ -94,8 +99,8 @@ pub mod sub_dao_authority;
 pub mod grant_appeals;
 pub mod wasm_hash_verification;
 pub mod cross_chain_metadata;
-pub mod temporal_guard;
 pub mod yield_reserve;
+pub mod cleanup_bounty;
 
 // --- Test Modules ---
 #[cfg(test)]
@@ -647,6 +652,35 @@ pub struct SlashingProposal {
     pub executed_at: Option<u64>, // When slashing was executed
 }
 
+// --- Oracle Safety Valve Types (Issue #102) ---
+
+/// Status of a DAO safety-valve vote to manually set the exchange rate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum SafetyVoteStatus {
+    Active,   // Voting open
+    Approved, // 90% supermajority reached; ready to execute
+    Rejected, // Failed to reach threshold
+    Executed, // Rate has been applied
+}
+
+/// A DAO proposal to manually override the oracle exchange rate.
+#[derive(Clone)]
+#[contracttype]
+pub struct SafetyVoteProposal {
+    pub proposal_id: u64,
+    pub proposer: Address,
+    /// Proposed rate as (numerator, denominator) — e.g. (105, 100) means 1.05
+    pub rate_numerator: i128,
+    pub rate_denominator: i128,
+    pub created_at: u64,
+    pub voting_deadline: u64,
+    pub status: SafetyVoteStatus,
+    pub votes_for: i128,
+    pub votes_against: i128,
+    pub total_voting_power: i128,
+}
+
 // --- Milestone System Types ---
 
 #[derive(Clone)]
@@ -1084,6 +1118,14 @@ pub enum DataKey {
     BalanceSyncRecords(u64),     // Maps grant_id to list of balance sync records
     SafetyPauseActive,           // Global safety pause flag
 
+    // Issue #102: Oracle Safety Valve keys
+    OracleLastHeartbeat,         // Last timestamp the oracle sent a heartbeat
+    SafetyVoteProposal(u64),     // Maps proposal_id to SafetyVoteProposal
+    SafetyVoteProposalIds,       // List of all safety vote proposal IDs
+    SafetyVoteVote(u64, Address),// Maps proposal_id + voter to their vote
+    NextSafetyProposalId,        // Next available safety proposal ID
+    ManualExchangeRate,          // Manually set exchange rate (numerator, denominator)
+
 #[contracterror]
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 #[repr(u32)]
@@ -1134,6 +1176,14 @@ pub enum Error {
     SafetyPauseActive = 301,
     BalanceSyncRequired = 302,
     RegulatedAssetRestriction = 303,
+
+    // Oracle Safety Valve errors (Issue #102)
+    OracleStillActive = 304,     // Oracle heartbeat is recent; manual override not allowed
+    SafetyProposalNotFound = 305,
+    SafetyVotingPeriodEnded = 306,
+    SafetyAlreadyVoted = 307,
+    SafetyApprovalThresholdNotMet = 308,
+    SafetyVotingPeriodActive = 309,
 
 }
 
@@ -2970,6 +3020,159 @@ impl GrantContract {
         env.events().publish((symbol_short!("inflatn"), grant_id), (pre_adj_flow_rate, new_rate));
         
         Ok(())
+    }
+
+    // --- Issue #102: Oracle Safety Valve ---
+
+    /// Called by the oracle to record a liveness heartbeat.
+    pub fn oracle_heartbeat(env: Env) -> Result<(), Error> {
+        require_oracle_auth(&env)?;
+        env.storage().instance().set(&DataKey::OracleLastHeartbeat, &env.ledger().timestamp());
+        env.events().publish((symbol_short!("hrtbeat"),), env.ledger().timestamp());
+        Ok(())
+    }
+
+    /// Any DAO member can propose a manual exchange rate when the oracle has been
+    /// silent for at least 48 hours.
+    pub fn propose_safety_rate(
+        env: Env,
+        proposer: Address,
+        rate_numerator: i128,
+        rate_denominator: i128,
+    ) -> Result<u64, Error> {
+        proposer.require_auth();
+        if rate_numerator <= 0 || rate_denominator <= 0 {
+            return Err(Error::InvalidRate);
+        }
+
+        // Enforce 48-hour oracle silence requirement
+        let last_beat: u64 = env.storage().instance()
+            .get(&DataKey::OracleLastHeartbeat)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        if now.saturating_sub(last_beat) < ORACLE_HEARTBEAT_TIMEOUT_SECS {
+            return Err(Error::OracleStillActive);
+        }
+
+        let total_power = get_total_voting_power(&env)?;
+        let proposal_id: u64 = env.storage().instance()
+            .get(&DataKey::NextSafetyProposalId)
+            .unwrap_or(0);
+
+        let proposal = SafetyVoteProposal {
+            proposal_id,
+            proposer,
+            rate_numerator,
+            rate_denominator,
+            created_at: now,
+            voting_deadline: now + SAFETY_VOTE_DURATION_SECS,
+            status: SafetyVoteStatus::Active,
+            votes_for: 0,
+            votes_against: 0,
+            total_voting_power: total_power,
+        };
+
+        env.storage().instance().set(&DataKey::SafetyVoteProposal(proposal_id), &proposal);
+        env.storage().instance().set(&DataKey::NextSafetyProposalId, &(proposal_id + 1));
+
+        let mut ids: Vec<u64> = env.storage().instance()
+            .get(&DataKey::SafetyVoteProposalIds)
+            .unwrap_or(vec![&env]);
+        ids.push_back(proposal_id);
+        env.storage().instance().set(&DataKey::SafetyVoteProposalIds, &ids);
+
+        env.events().publish((symbol_short!("sfvprop"), proposal_id), (rate_numerator, rate_denominator));
+        Ok(proposal_id)
+    }
+
+    /// DAO members vote on a safety-valve rate proposal.
+    pub fn vote_on_safety_rate(env: Env, voter: Address, proposal_id: u64, approve: bool) -> Result<(), Error> {
+        voter.require_auth();
+
+        let mut proposal: SafetyVoteProposal = env.storage().instance()
+            .get(&DataKey::SafetyVoteProposal(proposal_id))
+            .ok_or(Error::SafetyProposalNotFound)?;
+
+        if proposal.status != SafetyVoteStatus::Active {
+            return Err(Error::InvalidProposalStatus);
+        }
+        if env.ledger().timestamp() > proposal.voting_deadline {
+            return Err(Error::SafetyVotingPeriodEnded);
+        }
+        if env.storage().instance().has(&DataKey::SafetyVoteVote(proposal_id, voter.clone())) {
+            return Err(Error::SafetyAlreadyVoted);
+        }
+
+        let power = read_voting_power(&env, &voter);
+        if power == 0 { return Err(Error::InsufficientVotingPower); }
+
+        if approve {
+            proposal.votes_for = proposal.votes_for.checked_add(power).ok_or(Error::MathOverflow)?;
+        } else {
+            proposal.votes_against = proposal.votes_against.checked_add(power).ok_or(Error::MathOverflow)?;
+        }
+
+        env.storage().instance().set(&DataKey::SafetyVoteVote(proposal_id, voter), &approve);
+        env.storage().instance().set(&DataKey::SafetyVoteProposal(proposal_id), &proposal);
+        Ok(())
+    }
+
+    /// Execute an approved safety-valve proposal to set the manual exchange rate.
+    /// Requires 90% approval of votes cast and oracle still silent.
+    pub fn execute_safety_rate(env: Env, proposal_id: u64) -> Result<(), Error> {
+        let mut proposal: SafetyVoteProposal = env.storage().instance()
+            .get(&DataKey::SafetyVoteProposal(proposal_id))
+            .ok_or(Error::SafetyProposalNotFound)?;
+
+        if proposal.status != SafetyVoteStatus::Active {
+            return Err(Error::InvalidProposalStatus);
+        }
+        if env.ledger().timestamp() <= proposal.voting_deadline {
+            return Err(Error::SafetyVotingPeriodActive);
+        }
+
+        // Re-check oracle is still silent
+        let last_beat: u64 = env.storage().instance()
+            .get(&DataKey::OracleLastHeartbeat)
+            .unwrap_or(0);
+        if env.ledger().timestamp().saturating_sub(last_beat) < ORACLE_HEARTBEAT_TIMEOUT_SECS {
+            return Err(Error::OracleStillActive);
+        }
+
+        // Require 90% supermajority of votes cast
+        let votes_cast = proposal.votes_for.checked_add(proposal.votes_against).ok_or(Error::MathOverflow)?;
+        let approval_bps = if votes_cast > 0 {
+            proposal.votes_for.checked_mul(10000).ok_or(Error::MathOverflow)? / votes_cast
+        } else {
+            0
+        };
+        if approval_bps < SAFETY_APPROVAL_THRESHOLD as i128 {
+            proposal.status = SafetyVoteStatus::Rejected;
+            env.storage().instance().set(&DataKey::SafetyVoteProposal(proposal_id), &proposal);
+            return Err(Error::SafetyApprovalThresholdNotMet);
+        }
+
+        // Apply the manual exchange rate
+        env.storage().instance().set(
+            &DataKey::ManualExchangeRate,
+            &(proposal.rate_numerator, proposal.rate_denominator),
+        );
+
+        proposal.status = SafetyVoteStatus::Executed;
+        env.storage().instance().set(&DataKey::SafetyVoteProposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (symbol_short!("sfvexec"), proposal_id),
+            (proposal.rate_numerator, proposal.rate_denominator),
+        );
+        Ok(())
+    }
+
+    /// Returns the active exchange rate: manual override if set, otherwise (1, 1).
+    pub fn get_exchange_rate(env: Env) -> (i128, i128) {
+        env.storage().instance()
+            .get::<_, (i128, i128)>(&DataKey::ManualExchangeRate)
+            .unwrap_or((1, 1))
     }
 
     pub fn manage_liquidity(env: Env, daily_liquidity: i128) -> Result<(), Error> {
@@ -6404,6 +6607,8 @@ mod test_financial_snapshot;
 #[cfg(test)]
 mod test_slashing;
 mod test_inflation;
+#[cfg(test)]
+mod test_oracle_safety_valve;
 #[cfg(test)]
 mod test_yield;
 #[cfg(test)]
