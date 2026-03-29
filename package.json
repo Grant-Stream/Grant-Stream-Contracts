@@ -1,17 +1,30 @@
 {
   "name": "grant-stream-contracts",
   "version": "1.0.0",
-  "description": "Grant-Stream Protocol Smart Contracts",
+  "description": "Smart contracts for Grant Stream with milestone completion proof hashing",
+  "main": "index.js",
   "scripts": {
-    "compile": "hardhat compile",
-    "test": "hardhat test",
-    "deploy": "hardhat run scripts/deploy.js"
+    "build": "forge build",
+    "test": "forge test",
+    "test-coverage": "forge coverage",
+    "deploy-local": "forge script script/Deploy.s.sol --rpc-url http://localhost:8545 --broadcast",
+    "verify": "forge verify-contract",
+    "lint": "solhint 'src/**/*.sol'",
+    "format": "forge fmt",
+    "clean": "forge clean"
   },
+  "keywords": [
+    "solidity",
+    "smart-contracts",
+    "ethereum",
+    "grants",
+    "milestones",
+    "proof-of-work",
+    "audit-trail"
+  ],
+  "author": "Grant Stream Team",
+  "license": "MIT",
   "devDependencies": {
-    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
-    "hardhat": "^2.19.0"
-  },
-  "dependencies": {
-    "@openzeppelin/contracts": "^5.0.0"
+    "solhint": "^3.6.2"
   }
 }
