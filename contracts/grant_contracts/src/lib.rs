@@ -96,6 +96,9 @@ pub mod wasm_hash_verification;
 pub mod cross_chain_metadata;
 pub mod temporal_guard;
 pub mod yield_reserve;
+pub mod reputation_decay;
+pub mod treasury_auto_refill;
+pub mod auditor_emergency;
 
 // --- Test Modules ---
 #[cfg(test)]
@@ -6411,4 +6414,3 @@ mod test_fee;
 #[cfg(test)]
 mod test_interest_redirection;
 #[cfg(test)]
-
