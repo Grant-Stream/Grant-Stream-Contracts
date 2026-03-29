@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./SustainabilityFund.sol";
+import "./ZKKYCVerifier.sol";
 
 /**
  * @title GrantStream
@@ -30,6 +31,13 @@ contract GrantStream is Ownable, ReentrancyGuard {
 
     SustainabilityFund public immutable sustainabilityFund;
 
+    /// @notice Optional ZK-KYC verifier. address(0) = KYC checks disabled.
+    ZKKYCVerifier public zkVerifier;
+
+    /// @notice When true, both the recipient at grant creation and the claimer
+    ///         at claim time must be verified in zkVerifier.
+    bool public kycRequired;
+
     struct Grant {
         address funder;
         address recipient;
@@ -47,6 +55,8 @@ contract GrantStream is Ownable, ReentrancyGuard {
     event FundsClaimed(uint256 indexed grantId, address indexed recipient, uint256 netAmount, uint256 sustainabilityTax);
     event GrantToppedUp(uint256 indexed grantId, uint256 amount);
     event GrantClosed(uint256 indexed grantId, uint256 refunded);
+    event ZKVerifierSet(address indexed zkVerifier);
+    event KYCRequirementChanged(bool required);
 
     // ─── Constructor ──────────────────────────────────────────────────────────
 
@@ -61,9 +71,34 @@ contract GrantStream is Ownable, ReentrancyGuard {
      * @notice Create a new grant by depositing ETH.
      * @param recipient Address that will receive streamed funds.
      */
+    /**
+     * @notice Owner sets or clears the ZK-KYC verifier contract.
+     * @param _zkVerifier Address of ZKKYCVerifier, or address(0) to disable.
+     */
+    function setZKVerifier(address _zkVerifier) external onlyOwner {
+        zkVerifier = ZKKYCVerifier(_zkVerifier);
+        emit ZKVerifierSet(_zkVerifier);
+    }
+
+    /**
+     * @notice Owner toggles whether KYC verification is required for grants.
+     *         Requires zkVerifier to be set before enabling.
+     * @param _required True to enforce KYC; false to allow permissionless grants.
+     */
+    function setKYCRequired(bool _required) external onlyOwner {
+        if (_required) {
+            require(address(zkVerifier) != address(0), "GrantStream: zkVerifier not set");
+        }
+        kycRequired = _required;
+        emit KYCRequirementChanged(_required);
+    }
+
     function createGrant(address recipient) external payable nonReentrant returns (uint256 grantId) {
         require(msg.value > 0, "GrantStream: no funds");
         require(recipient != address(0), "GrantStream: zero recipient");
+        if (kycRequired) {
+            require(zkVerifier.isVerified(recipient), "GrantStream: recipient not KYC verified");
+        }
 
         grantId = nextGrantId++;
         grants[grantId] = Grant({
@@ -86,6 +121,9 @@ contract GrantStream is Ownable, ReentrancyGuard {
         require(grant.active, "GrantStream: inactive grant");
         require(msg.sender == grant.recipient, "GrantStream: not recipient");
         require(amount > 0 && amount <= grant.balance, "GrantStream: invalid amount");
+        if (kycRequired) {
+            require(zkVerifier.isVerified(msg.sender), "GrantStream: recipient not KYC verified");
+        }
 
         grant.balance     -= amount;
         grant.totalVolume += amount;
