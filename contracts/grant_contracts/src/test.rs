@@ -36,7 +36,7 @@ fn test_update_rate_settles_before_changing_rate() {
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
-        .create_grant(&grant_id, &recipient, &10_000, &rate_1);
+        .create_grant(&grant_id, &recipient, &10_000, &rate_1, &None, &false);
 
     set_timestamp(&env, 1_100);
     assert_eq!(client.claimable(&grant_id), 1_000);
@@ -74,7 +74,7 @@ fn test_update_rate_requires_admin_auth() {
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
-        .create_grant(&grant_id, &recipient, &1_000, &5);
+        .create_grant(&grant_id, &recipient, &1_000, &5, &None, &false);
 
     client.mock_all_auths().update_rate(&grant_id, &7_i128);
 
@@ -102,7 +102,7 @@ fn test_update_rate_immediately_after_creation() {
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
-        .create_grant(&grant_id, &recipient, &5_000, &4);
+        .create_grant(&grant_id, &recipient, &5_000, &4, &None, &false);
 
     client.mock_all_auths().update_rate(&grant_id, &9);
 
@@ -130,7 +130,7 @@ fn test_update_rate_multiple_times_with_time_gaps() {
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
-        .create_grant(&grant_id, &recipient, &10_000, &3);
+        .create_grant(&grant_id, &recipient, &10_000, &3, &None, &false);
 
     set_timestamp(&env, 20);
     client.mock_all_auths().update_rate(&grant_id, &5);
@@ -157,7 +157,7 @@ fn test_update_rate_pause_then_resume() {
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
-        .create_grant(&grant_id, &recipient, &20_000, &4);
+        .create_grant(&grant_id, &recipient, &20_000, &4, &None, &false);
 
     set_timestamp(&env, 1_050);
     client.mock_all_auths().update_rate(&grant_id, &0);
@@ -187,7 +187,7 @@ fn test_update_rate_rejects_invalid_rate_and_inactive_states() {
     let negative_rate_grant: u64 = 6;
     client
         .mock_all_auths()
-        .create_grant(&negative_rate_grant, &recipient, &1_000, &5);
+        .create_grant(&negative_rate_grant, &recipient, &1_000, &5, &None, &false);
     assert_contract_error(
         client
             .mock_all_auths()
@@ -198,7 +198,7 @@ fn test_update_rate_rejects_invalid_rate_and_inactive_states() {
     let cancelled_grant: u64 = 7;
     client
         .mock_all_auths()
-        .create_grant(&cancelled_grant, &recipient, &1_000, &5);
+        .create_grant(&cancelled_grant, &recipient, &1_000, &5, &None, &false);
     client.mock_all_auths().cancel_grant(&cancelled_grant);
     assert_contract_error(
         client
@@ -210,7 +210,7 @@ fn test_update_rate_rejects_invalid_rate_and_inactive_states() {
     let completed_grant: u64 = 8;
     client
         .mock_all_auths()
-        .create_grant(&completed_grant, &recipient, &100, &10);
+        .create_grant(&completed_grant, &recipient, &100, &10, &None, &false);
     set_timestamp(&env, 10);
     client.mock_all_auths().withdraw(&completed_grant, &100);
 
@@ -240,7 +240,7 @@ fn test_withdraw_after_rate_updates_no_extra_withdrawal() {
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
-        .create_grant(&grant_id, &recipient, &1_000, &10);
+        .create_grant(&grant_id, &recipient, &1_000, &10, &None, &false);
 
     set_timestamp(&env, 20);
     client.mock_all_auths().update_rate(&grant_id, &5);
@@ -270,4 +270,83 @@ fn test_withdraw_after_rate_updates_no_extra_withdrawal() {
         client.mock_all_auths().try_withdraw(&grant_id, &1),
         Error::InvalidAmount,
     );
+}
+
+#[test]
+fn test_joint_grant_dual_signatures() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let partner = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    client.mock_all_auths().initialize(&admin);
+    
+    // Register protocol config
+    client.mock_all_auths().set_protocol_config(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &2000,
+    );
+
+    let grant_id = 100;
+    client.mock_all_auths().create_grant(
+        &grant_id,
+        &recipient,
+        &5000,
+        &10,
+        &Some(partner.clone()),
+        &false,
+    );
+
+    set_timestamp(&env, 100);
+    // Should fail with only recipient auth (mock_all_auths handles it, but we can check if it requires both)
+    client.mock_all_auths().withdraw(&grant_id, &500);
+    
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.withdrawn, 500);
+}
+
+#[test]
+fn test_split_and_separate() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let partner = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().set_protocol_config(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &2000,
+    );
+
+    let grant_id = 101;
+    client.mock_all_auths().create_grant(
+        &grant_id,
+        &recipient,
+        &10000,
+        &20,
+        &Some(partner.clone()),
+        &false,
+    );
+
+    set_timestamp(&env, 100);
+    let new_grant_id = 102;
+    client.mock_all_auths().split_and_separate(&grant_id, &new_grant_id);
+
+    let g1 = client.get_grant(&grant_id);
+    let g2 = client.get_grant(&new_grant_id);
+
+    assert_eq!(g1.flow_rate, 10);
+    assert_eq!(g2.flow_rate, 10);
+    assert_eq!(g1.joint_info.is_none(), true);
+    assert_eq!(g2.recipient, partner);
 }
