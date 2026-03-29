@@ -1,8 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
 };
 
 #[contract]
@@ -62,7 +61,7 @@ pub struct ProtocolConfig {
     pub sorosusu_address: Address,
     pub treasury_address: Address,
     pub sbt_minter_address: Address,
-    pub debt_divert_bps: i128, 
+    pub debt_divert_bps: i128,
 }
 
 #[contracterror]
@@ -81,12 +80,7 @@ pub enum Error {
     ConfigNotSet = 10,
 }
 
-// Constants
 pub const SCALING_FACTOR: i128 = 10_000_000;
-const TAX_THRESHOLD: i128 = 100_000 * 10_000_000; 
-const TAX_BPS: i128 = 1;
-
-// --- Implementation ---
 
 #[contractimpl]
 impl GrantContract {
@@ -100,25 +94,72 @@ impl GrantContract {
         Ok(())
     }
 
+    pub fn set_protocol_config(env: Env, sorosusu: Address, treasury: Address, sbt_minter: Address, debt_divert_bps: i128) -> Result<(), Error> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        let config = ProtocolConfig {
+            sorosusu_address: sorosusu,
+            treasury_address: treasury,
+            sbt_minter_address: sbt_minter,
+            debt_divert_bps,
+        };
+        env.storage().instance().set(&DataKey::ProtocolConfig, &config);
+        Ok(())
+    }
+
+    pub fn create_grant(env: Env, grant_id: u64, recipient: Address, total_amount: i128, flow_rate: i128, warmup_duration: u64, partner: Option<Address>, auto_debt_service: bool) -> Result<(), Error> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        let now = env.ledger().timestamp();
+        let grant = Grant {
+            recipient: recipient.clone(),
+            total_amount,
+            withdrawn: 0,
+            claimable: 0,
+            flow_rate,
+            last_update_ts: now,
+            rate_updated_at: now,
+            last_claim_time: now,
+            pending_rate: 0,
+            effective_timestamp: 0,
+            status: GrantStatus::Active,
+            joint_info: partner.map(|p| JointGrantInfo { partner: p }),
+            sorosusu_debt_service: auto_debt_service,
+            total_volume_serviced: 0,
+            start_time: now,
+            warmup_duration,
+        };
+        env.storage().instance().set(&DataKey::Grant(grant_id), &grant);
+        Ok(())
+    }
+
     pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
         let mut grant: Grant = env.storage().instance().get(&DataKey::Grant(grant_id)).ok_or(Error::GrantNotFound)?;
-        
         grant.recipient.require_auth();
-        if let Some(info) = &grant.joint_info {
-            info.partner.require_auth();
+        if let Some(info) = &grant.joint_info { info.partner.require_auth(); }
+        
+        let now = env.ledger().timestamp();
+        let elapsed = (now - grant.last_update_ts) as i128;
+        let mut delta = (elapsed * grant.flow_rate) / SCALING_FACTOR;
+
+        if grant.warmup_duration > 0 {
+            let end = grant.start_time + grant.warmup_duration;
+            let multiplier = if now >= end { 10000 } else if now <= grant.start_time { 2500 } else {
+                2500 + (7500 * ((now - grant.start_time) as i128 * 10000 / grant.warmup_duration as i128) / 10000)
+            };
+            delta = (delta * multiplier) / 10000;
         }
 
-        settle_internal(&env, &mut grant, env.ledger().timestamp())?;
-
+        grant.claimable += delta;
         if amount > grant.claimable || amount <= 0 { return Err(Error::InvalidAmount); }
-
+        
         grant.claimable -= amount;
         grant.withdrawn += amount;
-        grant.last_claim_time = env.ledger().timestamp();
+        grant.last_update_ts = now;
+        grant.last_claim_time = now;
 
-        let token_client = token::Client::new(&env, &env.storage().instance().get(&DataKey::GrantToken).unwrap());
-        token_client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
-
+        let token_addr: Address = env.storage().instance().get(&DataKey::GrantToken).unwrap();
+        token::Client::new(&env, &token_addr).transfer(&env.current_contract_address(), &grant.recipient, &amount);
         env.storage().instance().set(&DataKey::Grant(grant_id), &grant);
         Ok(())
     }
@@ -126,33 +167,18 @@ impl GrantContract {
     pub fn get_grant(env: Env, grant_id: u64) -> Result<Grant, Error> {
         env.storage().instance().get(&DataKey::Grant(grant_id)).ok_or(Error::GrantNotFound)
     }
-}
 
-// --- Helper for Accrual (The most complex part) ---
-fn settle_internal(env: &Env, grant: &mut Grant, now: u64) -> Result<(), Error> {
-    if now <= grant.last_update_ts { return Ok(()); }
-    
-    let elapsed = (now - grant.last_update_ts) as i128;
-    let mut delta = (elapsed * grant.flow_rate) / SCALING_FACTOR;
-
-    // Apply Warmup multiplier if applicable
-    if grant.warmup_duration > 0 {
-        let multiplier = calculate_multiplier(grant, now);
-        delta = (delta * multiplier) / 10000;
+    pub fn claimable(env: Env, grant_id: u64) -> i128 {
+        if let Ok(grant) = env.storage().instance().get::<_, Grant>(&DataKey::Grant(grant_id)) {
+            let elapsed = (env.ledger().timestamp() - grant.last_update_ts) as i128;
+            grant.claimable + ((elapsed * grant.flow_rate) / SCALING_FACTOR)
+        } else { 0 }
     }
 
-    let remaining = grant.total_amount - (grant.withdrawn + grant.claimable);
-    if delta > remaining { delta = remaining; }
-
-    grant.claimable += delta;
-    grant.last_update_ts = now;
-    Ok(())
-}
-
-fn calculate_multiplier(grant: &Grant, now: u64) -> i128 {
-    let end = grant.start_time + grant.warmup_duration;
-    if now >= end { return 10000; }
-    if now <= grant.start_time { return 2500; }
-    let progress = ((now - grant.start_time) as i128 * 10000) / (grant.warmup_duration as i128);
-    2500 + (7500 * progress / 10000)
+    pub fn slash_inactive_grant(env: Env, grant_id: u64) -> Result<(), Error> {
+        let mut grant: Grant = env.storage().instance().get(&DataKey::Grant(grant_id)).ok_or(Error::GrantNotFound)?;
+        grant.status = GrantStatus::Cancelled;
+        env.storage().instance().set(&DataKey::Grant(grant_id), &grant);
+        Ok(())
+    }
 }
