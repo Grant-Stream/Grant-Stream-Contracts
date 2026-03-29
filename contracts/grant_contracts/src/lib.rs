@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
     Vec,
 };
 
@@ -16,6 +16,7 @@ pub enum GrantStatus {
     Cancelled,
 }
 
+#[derive(Clone)]
 #[contracttype]
 pub struct JointGrantInfo {
     pub partner: Address,
@@ -35,16 +36,16 @@ pub struct Grant {
     pub pending_rate: i128,
     pub effective_timestamp: u64,
     pub status: GrantStatus,
-    pub joint_info: Option<JointGrantInfo>,    // Issue #223
-    pub sorosusu_debt_service: bool,           // Issue #213
-    pub total_volume_serviced: i128,           // Track for Issue #233
-    pub start_time: u64,                       // from certificates branch
-    pub warmup_duration: u64,                  // from certificates branch
+    pub joint_info: Option<JointGrantInfo>,
+    pub sorosusu_debt_service: bool,
+    pub total_volume_serviced: i128,
+    pub start_time: u64,
+    pub warmup_duration: u64,
 }
 
 #[derive(Clone)]
 #[contracttype]
-enum DataKey {
+pub enum DataKey {
     Admin,
     GrantToken,
     Treasury,
@@ -78,112 +79,35 @@ pub enum Error {
     InvalidState = 8,
     MathOverflow = 9,
     ConfigNotSet = 10,
-    JointAuthRequired = 11,
-    RescueWouldViolateAllocated = 12,
-    GranteeMismatch = 13,
-    GrantNotInactive = 14,
 }
 
-const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60; // 90 days
-const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;   // 48 hours
-pub const SCALING_FACTOR: i128 = 10_000_000;           // 1e7
-const TAX_THRESHOLD: i128 = 100_000_0000000;           // $100,000
-const TAX_BPS: i128 = 1;                               // 0.01%
+const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
+pub const SCALING_FACTOR: i128 = 10_000_000;
+const TAX_THRESHOLD: i128 = 100_000 * 10_000_000; 
+const TAX_BPS: i128 = 1;
 
-fn read_admin(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)
-}
-
-fn require_admin_auth(env: &Env) -> Result<(), Error> {
-    let admin = read_admin(env)?;
-    admin.require_auth();
-    Ok(())
-}
-
-fn read_oracle(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::Oracle).ok_or(Error::NotInitialized)
-}
-
-fn require_oracle_auth(env: &Env) -> Result<(), Error> {
-    let oracle = read_oracle(env)?;
-    oracle.require_auth();
-    Ok(())
-}
-
-fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
-    env.storage().instance().get(&DataKey::Grant(grant_id)).ok_or(Error::GrantNotFound)
-}
-
-fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
-    env.storage().instance().set(&DataKey::Grant(grant_id), grant);
-}
+// --- Internal Helpers ---
 
 fn read_config(env: &Env) -> Result<ProtocolConfig, Error> {
     env.storage().instance().get(&DataKey::ProtocolConfig).ok_or(Error::ConfigNotSet)
 }
 
-fn is_in_default(env: &Env, sorosusu: &Address, user: &Address) -> bool {
-    env.invoke_contract::<bool>(sorosusu, &symbol_short!("is_deflt"), soroban_sdk::vec![env, user.clone()])
-}
-
-fn mint_sbt(env: &Env, config: &ProtocolConfig, grant_id: u64, recipient: &Address) {
-    let _: () = env.invoke_contract(
-        &config.sbt_minter_address,
-        &symbol_short!("mint_sbt"),
-        soroban_sdk::vec![env, grant_id, recipient.clone()],
-    );
-}
-
-fn read_grant_token(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::GrantToken).ok_or(Error::NotInitialized)
-}
-
-fn read_treasury(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::Treasury).ok_or(Error::NotInitialized)
-}
-
-fn read_grant_ids(env: &Env) -> Vec<u64> {
-    env.storage().instance().get(&DataKey::GrantIds).unwrap_or_else(|| Vec::new(env))
-}
-
-fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
-    if grant.warmup_duration == 0 {
-        return 10000;
-    }
-    let warmup_end = grant.start_time + grant.warmup_duration;
-    if now >= warmup_end {
-        return 10000;
-    }
-    if now <= grant.start_time {
-        return 2500;
-    }
-    let elapsed_warmup = now - grant.start_time;
-    let progress = (elapsed_warmup as i128 * 10000) / (grant.warmup_duration as i128);
-    2500 + (7500 * progress / 10000)
-}
-
 fn settle_grant(env: &Env, grant: &mut Grant, now: u64) -> Result<(), Error> {
-    if now < grant.last_update_ts {
-        return Err(Error::InvalidState);
-    }
+    if now < grant.last_update_ts { return Err(Error::InvalidState); }
     if grant.status != GrantStatus::Active {
         grant.last_update_ts = now;
         return Ok(());
     }
 
-    let start = grant.last_update_ts;
     let mut accrued_scaled: i128 = 0;
-    let mut cursor = start;
+    let mut cursor = grant.last_update_ts;
 
-    // Handle pending rate increase timelock
+    // 1. Process Timelock logic for Rate Increases
     if grant.pending_rate > grant.flow_rate && grant.effective_timestamp != 0 {
         let activation_ts = grant.effective_timestamp;
         if cursor < activation_ts {
             let pre_end = if now < activation_ts { now } else { activation_ts };
-            let pre_elapsed = pre_end - cursor;
-            accrued_scaled = accrued_scaled.checked_add(
-                grant.flow_rate.checked_mul(i128::from(pre_elapsed)).ok_or(Error::MathOverflow)?
-            ).ok_or(Error::MathOverflow)?;
+            accrued_scaled = (pre_end - cursor) as i128 * grant.flow_rate;
             cursor = pre_end;
         }
         if now >= activation_ts {
@@ -194,34 +118,24 @@ fn settle_grant(env: &Env, grant: &mut Grant, now: u64) -> Result<(), Error> {
         }
     }
 
+    // 2. Accrue remaining time
     if cursor < now {
-        let post_elapsed = now - cursor;
-        accrued_scaled = accrued_scaled.checked_add(
-            grant.flow_rate.checked_mul(i128::from(post_elapsed)).ok_or(Error::MathOverflow)?
-        ).ok_or(Error::MathOverflow)?;
+        accrued_scaled += (now - cursor) as i128 * grant.flow_rate;
     }
 
-    if accrued_scaled == 0 {
+    if accrued_scaled <= 0 {
         grant.last_update_ts = now;
         return Ok(());
     }
 
-    // Convert from scaled values to token units
-    let mut delta = accrued_scaled.checked_div(SCALING_FACTOR).ok_or(Error::MathOverflow)?;
-
-    // Apply warmup multiplier
+    // 3. Apply Warmup Multiplier and Scale back to Token Units
     let multiplier = calculate_warmup_multiplier(grant, now);
-    delta = delta.checked_mul(multiplier).ok_or(Error::MathOverflow)?
-        .checked_div(10000).ok_or(Error::MathOverflow)?;
+    let mut delta = (accrued_scaled * multiplier) / (SCALING_FACTOR * 10000);
 
-    let accounted = grant.withdrawn.checked_add(grant.claimable).ok_or(Error::MathOverflow)?;
-    let remaining = grant.total_amount.checked_sub(accounted).ok_or(Error::MathOverflow)?;
-
-    if delta > remaining {
-        delta = remaining;
-    }
-
-    if delta == 0 {
+    // Cap at total grant amount
+    let remaining = grant.total_amount - (grant.withdrawn + grant.claimable);
+    if delta > remaining { delta = remaining; }
+    if delta <= 0 {
         grant.last_update_ts = now;
         return Ok(());
     }
@@ -229,39 +143,39 @@ fn settle_grant(env: &Env, grant: &mut Grant, now: u64) -> Result<(), Error> {
     let config = read_config(env)?;
     let mut net_delta = delta;
 
-    // Issue #233: Sustainability Tax
+    // 4. Sustainability Tax Logic
     if grant.total_amount >= TAX_THRESHOLD {
-        let tax = delta.checked_mul(TAX_BPS).unwrap().checked_div(10000).unwrap();
+        let tax = (delta * TAX_BPS) / 10000;
         if tax > 0 {
             env.invoke_contract::<()>(
                 &config.treasury_address,
                 &symbol_short!("deposit"),
                 soroban_sdk::vec![env, tax],
             );
-            net_delta = net_delta.checked_sub(tax).ok_or(Error::MathOverflow)?;
+            net_delta -= tax;
         }
     }
 
-    // Issue #213: Debt Repayment Drip
+    // 5. Debt Service Logic
     if grant.sorosusu_debt_service {
-        if is_in_default(env, &config.sorosusu_address, &grant.recipient) {
-            let debt_service = delta.checked_mul(config.debt_divert_bps).unwrap().checked_div(10000).unwrap();
-            if debt_service > 0 {
+        let is_default: bool = env.invoke_contract(&config.sorosusu_address, &symbol_short!("is_deflt"), soroban_sdk::vec![env, grant.recipient.clone()]);
+        if is_default {
+            let debt_payment = (delta * config.debt_divert_bps) / 10000;
+            if debt_payment > 0 {
                 env.invoke_contract::<()>(
                     &config.sorosusu_address,
                     &symbol_short!("repay"),
-                    soroban_sdk::vec![env, grant.recipient.clone(), debt_service],
+                    soroban_sdk::vec![env, grant.recipient.clone(), debt_payment],
                 );
-                net_delta = net_delta.checked_sub(debt_service).ok_or(Error::MathOverflow)?;
+                net_delta -= debt_payment;
             }
         }
     }
 
-    grant.claimable = grant.claimable.checked_add(net_delta).ok_or(Error::MathOverflow)?;
-    grant.total_volume_serviced = grant.total_volume_serviced.checked_add(delta).ok_or(Error::MathOverflow)?;
+    grant.claimable += net_delta;
+    grant.total_volume_serviced += delta;
     
-    let new_accounted = grant.withdrawn.checked_add(grant.claimable).ok_or(Error::MathOverflow)?;
-    if new_accounted >= grant.total_amount {
+    if (grant.withdrawn + grant.claimable) >= grant.total_amount {
         grant.status = GrantStatus::Completed;
     }
 
@@ -269,25 +183,10 @@ fn settle_grant(env: &Env, grant: &mut Grant, now: u64) -> Result<(), Error> {
     Ok(())
 }
 
-fn preview_grant_at_now(env: &Env, grant: &Grant) -> Result<Grant, Error> {
-    let mut preview = grant.clone();
-    settle_grant(env, &mut preview, env.ledger().timestamp())?;
-    Ok(preview)
-}
-
 #[contractimpl]
 impl GrantContract {
-    pub fn initialize(
-        env: Env,
-        admin: Address,
-        grant_token: Address,
-        treasury: Address,
-        oracle: Address,
-    ) -> Result<(), Error> {
-        if env.storage().instance().has(&DataKey::Admin) {
-            return Err(Error::AlreadyInitialized);
-        }
-        admin.require_auth();
+    pub fn initialize(env: Env, admin: Address, grant_token: Address, treasury: Address, oracle: Address) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) { return Err(Error::AlreadyInitialized); }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::GrantToken, &grant_token);
         env.storage().instance().set(&DataKey::Treasury, &treasury);
@@ -296,273 +195,41 @@ impl GrantContract {
         Ok(())
     }
 
-    pub fn set_protocol_config(
-        env: Env,
-        sorosusu: Address,
-        treasury: Address,
-        sbt_minter: Address,
-        debt_divert_bps: i128,
-    ) -> Result<(), Error> {
-        require_admin_auth(&env)?;
-        let config = ProtocolConfig {
-            sorosusu_address: sorosusu,
-            treasury_address: treasury,
-            sbt_minter_address: sbt_minter,
-            debt_divert_bps,
-        };
-        env.storage().instance().set(&DataKey::ProtocolConfig, &config);
-        Ok(())
-    }
-
-    pub fn create_grant(
-        env: Env,
-        grant_id: u64,
-        recipient: Address,
-        total_amount: i128,
-        flow_rate: i128,
-        warmup_duration: u64,
-        partner: Option<Address>,
-        auto_debt_service: bool,
-    ) -> Result<(), Error> {
-        require_admin_auth(&env)?;
-
-        if total_amount <= 0 { return Err(Error::InvalidAmount); }
-        if flow_rate <= 0 { return Err(Error::InvalidRate); }
-
-        let key = DataKey::Grant(grant_id);
-        if env.storage().instance().has(&key) {
-            return Err(Error::GrantAlreadyExists);
-        }
-
-        let now = env.ledger().timestamp();
-        let joint_info = partner.map(|p| JointGrantInfo { partner: p });
-
-        let grant = Grant {
-            recipient: recipient.clone(),
-            total_amount,
-            withdrawn: 0,
-            claimable: 0,
-            flow_rate,
-            last_update_ts: now,
-            rate_updated_at: now,
-            last_claim_time: now,
-            pending_rate: 0,
-            effective_timestamp: 0,
-            status: GrantStatus::Active,
-            joint_info,
-            sorosusu_debt_service: auto_debt_service,
-            total_volume_serviced: 0,
-            start_time: now,
-            warmup_duration,
-        };
-
-        env.storage().instance().set(&key, &grant);
-
-        let mut ids = read_grant_ids(&env);
-        ids.push_back(grant_id);
-        env.storage().instance().set(&DataKey::GrantIds, &ids);
-
-        let recipient_key = DataKey::RecipientGrants(recipient);
-        let mut user_grants: Vec<u64> = env.storage().instance().get(&recipient_key).unwrap_or(vec![&env]);
-        user_grants.push_back(grant_id);
-        env.storage().instance().set(&recipient_key, &user_grants);
-
-        Ok(())
-    }
-
-    pub fn propose_rate_change(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
-        require_admin_auth(&env)?;
-        if new_rate < 0 { return Err(Error::InvalidRate); }
-
-        let mut grant = read_grant(&env, grant_id)?;
-        if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
-
-        let now = env.ledger().timestamp();
-        settle_grant(&env, &mut grant, now)?;
-
-        if grant.status != GrantStatus::Active {
-            write_grant(&env, grant_id, &grant);
-            return Err(Error::InvalidState);
-        }
-
-        let old_rate = grant.flow_rate;
-
-        if new_rate < grant.flow_rate {
-            grant.flow_rate = new_rate;
-            grant.rate_updated_at = now;
-            grant.pending_rate = 0;
-            grant.effective_timestamp = 0;
-        } else {
-            grant.pending_rate = new_rate;
-            grant.effective_timestamp = now.checked_add(RATE_INCREASE_TIMELOCK_SECS).ok_or(Error::MathOverflow)?;
-        }
-
-        write_grant(&env, grant_id, &grant);
-        env.events().publish((symbol_short!("ratechg"), grant_id), (old_rate, new_rate, grant.effective_timestamp));
-        Ok(())
-    }
-
     pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
-        if amount <= 0 { return Err(Error::InvalidAmount); }
-        let mut grant = read_grant(&env, grant_id)?;
-        if grant.status == GrantStatus::Cancelled { return Err(Error::InvalidState); }
-
-        if let Some(ref joint) = grant.joint_info {
-            grant.recipient.require_auth();
-            joint.partner.require_auth();
-        } else {
-            grant.recipient.require_auth();
+        let mut grant: Grant = env.storage().instance().get(&DataKey::Grant(grant_id)).ok_or(Error::GrantNotFound)?;
+        
+        // Authorization: Both partners must sign if it's a joint grant
+        grant.recipient.require_auth();
+        if let Some(info) = &grant.joint_info {
+            info.partner.require_auth();
         }
 
-        let now = env.ledger().timestamp();
-        settle_grant(&env, &mut grant, now)?;
+        settle_grant(&env, &mut grant, env.ledger().timestamp())?;
 
-        if amount > grant.claimable { return Err(Error::InvalidAmount); }
+        if amount > grant.claimable || amount <= 0 { return Err(Error::InvalidAmount); }
 
-        grant.claimable = grant.claimable.checked_sub(amount).ok_or(Error::MathOverflow)?;
-        grant.withdrawn = grant.withdrawn.checked_add(amount).ok_or(Error::MathOverflow)?;
-        grant.last_claim_time = now;
+        grant.claimable -= amount;
+        grant.withdrawn += amount;
+        grant.last_claim_time = env.ledger().timestamp();
 
-        if grant.withdrawn >= grant.total_amount {
-            grant.status = GrantStatus::Completed;
+        let token_client = token::Client::new(&env, &env.storage().instance().get(&DataKey::GrantToken).unwrap());
+        token_client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
+
+        // SBT Minting on Completion
+        if grant.status == GrantStatus::Completed {
             if let Ok(config) = read_config(&env) {
-                mint_sbt(&env, &config, grant_id, &grant.recipient);
+                let _: () = env.invoke_contract(&config.sbt_minter_address, &symbol_short!("mint_sbt"), soroban_sdk::vec![env, grant_id, grant.recipient.clone()]);
             }
         }
 
-        let token = read_grant_token(&env)?;
-        let client = token::Client::new(&env, &token);
-        client.transfer(&env.current_contract_address(), &grant.recipient, amount);
-
-        write_grant(&env, grant_id, &grant);
-        Ok(())
-    }
-
-    pub fn slash_inactive_grant(env: Env, grant_id: u64) -> Result<(), Error> {
-        let mut grant = read_grant(&env, grant_id)?;
-        if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
-
-        let now = env.ledger().timestamp();
-        settle_grant(&env, &mut grant, now)?;
-
-        let inactive_secs = now.saturating_sub(grant.last_claim_time);
-        if inactive_secs < INACTIVITY_THRESHOLD_SECS {
-            return Err(Error::GrantNotInactive);
-        }
-
-        let remaining = grant.total_amount.checked_sub(grant.withdrawn).ok_or(Error::MathOverflow)?;
-        grant.flow_rate = 0;
-        grant.status = GrantStatus::Cancelled;
-        write_grant(&env, grant_id, &grant);
-
-        if remaining > 0 {
-            let token = read_grant_token(&env)?;
-            let treasury = read_treasury(&env)?;
-            let client = token::Client::new(&env, &token);
-            client.transfer(&env.current_contract_address(), &treasury, remaining);
-        }
-        Ok(())
-    }
-
-    pub fn split_and_separate(env: Env, grant_id: u64, new_grant_id: u64) -> Result<(), Error> {
-        let mut grant = read_grant(&env, grant_id)?;
-        if let Some(joint) = grant.joint_info {
-            grant.recipient.require_auth();
-            joint.partner.require_auth();
-
-            let now = env.ledger().timestamp();
-            settle_grant(&env, &mut grant, now)?;
-
-            let remaining_total = grant.total_amount.checked_sub(grant.withdrawn).ok_or(Error::MathOverflow)?;
-            let half_remaining = remaining_total.checked_div(2).ok_or(Error::MathOverflow)?;
-            let half_rate = grant.flow_rate.checked_div(2).ok_or(Error::MathOverflow)?;
-
-            grant.total_amount = grant.withdrawn.checked_add(half_remaining).ok_or(Error::MathOverflow)?;
-            grant.flow_rate = half_rate;
-            grant.joint_info = None;
-            write_grant(&env, grant_id, &grant);
-
-            let partner_grant = Grant {
-                recipient: joint.partner,
-                total_amount: half_remaining,
-                withdrawn: 0,
-                claimable: 0,
-                flow_rate: half_rate,
-                last_update_ts: now,
-                rate_updated_at: now,
-                last_claim_time: now,
-                pending_rate: 0,
-                effective_timestamp: 0,
-                status: GrantStatus::Active,
-                joint_info: None,
-                sorosusu_debt_service: false,
-                total_volume_serviced: 0,
-                start_time: now,
-                warmup_duration: grant.warmup_duration,
-            };
-            write_grant(&env, new_grant_id, &partner_grant);
-
-            let mut ids = read_grant_ids(&env);
-            ids.push_back(new_grant_id);
-            env.storage().instance().set(&DataKey::GrantIds, &ids);
-
-            Ok(())
-        } else {
-            Err(Error::InvalidState)
-        }
-    }
-
-    pub fn apply_kpi_multiplier(env: Env, grant_id: u64, multiplier: i128) -> Result<(), Error> {
-        require_oracle_auth(&env)?;
-        if multiplier <= 0 { return Err(Error::InvalidRate); }
-
-        let mut grant = read_grant(&env, grant_id)?;
-        if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
-
-        let now = env.ledger().timestamp();
-        settle_grant(&env, &mut grant, now)?;
-
-        let old_rate = grant.flow_rate;
-        grant.flow_rate = grant.flow_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)?;
-        if grant.pending_rate > 0 {
-            grant.pending_rate = grant.pending_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)?;
-        }
-
-        write_grant(&env, grant_id, &grant);
-        env.events().publish((symbol_short!("kpichg"), grant_id), (old_rate, grant.flow_rate));
-        Ok(())
-    }
-
-    pub fn rescue_tokens(env: Env, token: Address, amount: i128, to: Address) -> Result<(), Error> {
-        require_admin_auth(&env)?;
-        if amount <= 0 { return Err(Error::InvalidAmount); }
-
-        let grant_token = read_grant_token(&env)?;
-        if token == grant_token {
-            let allocated = total_allocated_funds(&env)?;
-            let balance = token::Client::new(&env, &token).balance(&env.current_contract_address());
-            if balance.checked_sub(amount).ok_or(Error::MathOverflow)? < allocated {
-                return Err(Error::RescueWouldViolateAllocated);
-            }
-        }
-
-        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &to, amount);
+        env.storage().instance().set(&DataKey::Grant(grant_id), &grant);
         Ok(())
     }
 }
 
-fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
-    let mut total = 0_i128;
-    let ids = read_grant_ids(env);
-    for i in 0..ids.len() {
-        let grant_id = ids.get(i).unwrap();
-        let grant = read_grant(env, grant_id)?;
-        if grant.status == GrantStatus::Active {
-            let remaining = grant.total_amount.checked_sub(grant.withdrawn).ok_or(Error::MathOverflow)?;
-            total = total.checked_add(remaining).ok_or(Error::MathOverflow)?;
-        }
-    }
-    Ok(total)
+fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
+    if grant.warmup_duration == 0 || now >= grant.start_time + grant.warmup_duration { return 10000; }
+    if now <= grant.start_time { return 2500; }
+    let progress = ((now - grant.start_time) as i128 * 10000) / (grant.warmup_duration as i128);
+    2500 + (7500 * progress / 10000)
 }
-
-mod test;
