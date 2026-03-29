@@ -44,7 +44,22 @@ impl GrantContract {
         let max_ttl = env.storage().max_ttl();
         env.storage().instance().extend_ttl(THRESHOLD, max_ttl);
     }
+/// Calculate the real-world purchasing power of a grant amount based on a given inflation rate.
+    /// inflation_rate_bps is expected as a basis point (e.g., 500 = 5%)
+    pub fn get_grantee_spending_power(env: Env, amount: i128, inflation_rate_bps: i128) -> i128 {
+        if amount <= 0 {
+            return 0;
+        }
 
+        // Basis points scaling factor (10,000 = 100.00%)
+        let bps_divisor = 10_000;
+        
+        // Formula: Amount / (1 + Rate)
+        // Scaled for BPS logic: (Amount * 10,000) / (10,000 + Rate_BPS)
+        let adjusted_power = (amount * bps_divisor) / (bps_divisor + inflation_rate_bps);
+
+        adjusted_power
+    }
     // ─── Bridge: Use SubStream revenue as collateral for Grant ───
     pub fn use_substream_as_collateral(env: Env, grant_id: u64, substream_id: u64) -> bool {
         Self::ensure_sufficient_ttl(&env);
