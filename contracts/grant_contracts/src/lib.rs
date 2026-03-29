@@ -62,7 +62,7 @@ pub struct ProtocolConfig {
     pub sorosusu_address: Address,
     pub treasury_address: Address,
     pub sbt_minter_address: Address,
-    pub debt_divert_bps: i128, // e.g., 2000 for 20%
+    pub debt_divert_bps: i128, 
 }
 
 #[contracterror]
@@ -81,107 +81,12 @@ pub enum Error {
     ConfigNotSet = 10,
 }
 
-const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
+// Constants
 pub const SCALING_FACTOR: i128 = 10_000_000;
 const TAX_THRESHOLD: i128 = 100_000 * 10_000_000; 
 const TAX_BPS: i128 = 1;
 
-// --- Internal Helpers ---
-
-fn read_config(env: &Env) -> Result<ProtocolConfig, Error> {
-    env.storage().instance().get(&DataKey::ProtocolConfig).ok_or(Error::ConfigNotSet)
-}
-
-fn settle_grant(env: &Env, grant: &mut Grant, now: u64) -> Result<(), Error> {
-    if now < grant.last_update_ts { return Err(Error::InvalidState); }
-    if grant.status != GrantStatus::Active {
-        grant.last_update_ts = now;
-        return Ok(());
-    }
-
-    let mut accrued_scaled: i128 = 0;
-    let mut cursor = grant.last_update_ts;
-
-    // 1. Process Timelock logic for Rate Increases
-    if grant.pending_rate > grant.flow_rate && grant.effective_timestamp != 0 {
-        let activation_ts = grant.effective_timestamp;
-        if cursor < activation_ts {
-            let pre_end = if now < activation_ts { now } else { activation_ts };
-            accrued_scaled = (pre_end - cursor) as i128 * grant.flow_rate;
-            cursor = pre_end;
-        }
-        if now >= activation_ts {
-            grant.flow_rate = grant.pending_rate;
-            grant.rate_updated_at = activation_ts;
-            grant.pending_rate = 0;
-            grant.effective_timestamp = 0;
-        }
-    }
-
-    // 2. Accrue remaining time
-    if cursor < now {
-        accrued_scaled += (now - cursor) as i128 * grant.flow_rate;
-    }
-
-    if accrued_scaled <= 0 {
-        grant.last_update_ts = now;
-        return Ok(());
-    }
-
-    // 3. Apply Warmup Multiplier and Scale back to Token Units
-    let multiplier = calculate_warmup_multiplier(grant, now);
-    let mut delta = (accrued_scaled * multiplier) / (SCALING_FACTOR * 10000);
-
-    // Cap at total grant amount
-    let remaining = grant.total_amount - (grant.withdrawn + grant.claimable);
-    if delta > remaining { delta = remaining; }
-    if delta <= 0 {
-        grant.last_update_ts = now;
-        return Ok(());
-    }
-
-    let config = read_config(env)?;
-    let mut net_delta = delta;
-
-    // 4. Sustainability Tax Logic
-    if grant.total_amount >= TAX_THRESHOLD {
-        let tax = (delta * TAX_BPS) / 10000;
-        if tax > 0 {
-            env.invoke_contract::<()>(
-                &config.treasury_address,
-                &symbol_short!("deposit"),
-                soroban_sdk::vec![env, tax],
-            );
-            net_delta -= tax;
-        }
-    }
-
-    // 5. Debt Service Logic
-    if grant.sorosusu_debt_service {
-        let is_default: bool = env.invoke_contract(&config.sorosusu_address, &symbol_short!("is_deflt"), soroban_sdk::vec![env, grant.recipient.clone()]);
-        if is_default {
-            let debt_payment = (delta * config.debt_divert_bps) / 10000;
-            if debt_payment > 0 {
-                env.invoke_contract::<()>(
-                    &config.sorosusu_address,
-                    &symbol_short!("repay"),
-                    soroban_sdk::vec![env, grant.recipient.clone(), debt_payment],
-                );
-                net_delta -= debt_payment;
-            }
-        }
-    }
-
-    grant.claimable += net_delta;
-    grant.total_volume_serviced += delta;
-    
-    if (grant.withdrawn + grant.claimable) >= grant.total_amount {
-        grant.status = GrantStatus::Completed;
-    }
-
-    grant.last_update_ts = now;
-    Ok(())
-}
+// --- Implementation ---
 
 #[contractimpl]
 impl GrantContract {
@@ -198,13 +103,12 @@ impl GrantContract {
     pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
         let mut grant: Grant = env.storage().instance().get(&DataKey::Grant(grant_id)).ok_or(Error::GrantNotFound)?;
         
-        // Authorization: Both partners must sign if it's a joint grant
         grant.recipient.require_auth();
         if let Some(info) = &grant.joint_info {
             info.partner.require_auth();
         }
 
-        settle_grant(&env, &mut grant, env.ledger().timestamp())?;
+        settle_internal(&env, &mut grant, env.ledger().timestamp())?;
 
         if amount > grant.claimable || amount <= 0 { return Err(Error::InvalidAmount); }
 
@@ -215,20 +119,39 @@ impl GrantContract {
         let token_client = token::Client::new(&env, &env.storage().instance().get(&DataKey::GrantToken).unwrap());
         token_client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
 
-        // SBT Minting on Completion
-        if grant.status == GrantStatus::Completed {
-            if let Ok(config) = read_config(&env) {
-                let _: () = env.invoke_contract(&config.sbt_minter_address, &symbol_short!("mint_sbt"), soroban_sdk::vec![env, grant_id, grant.recipient.clone()]);
-            }
-        }
-
         env.storage().instance().set(&DataKey::Grant(grant_id), &grant);
         Ok(())
     }
+
+    pub fn get_grant(env: Env, grant_id: u64) -> Result<Grant, Error> {
+        env.storage().instance().get(&DataKey::Grant(grant_id)).ok_or(Error::GrantNotFound)
+    }
 }
 
-fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
-    if grant.warmup_duration == 0 || now >= grant.start_time + grant.warmup_duration { return 10000; }
+// --- Helper for Accrual (The most complex part) ---
+fn settle_internal(env: &Env, grant: &mut Grant, now: u64) -> Result<(), Error> {
+    if now <= grant.last_update_ts { return Ok(()); }
+    
+    let elapsed = (now - grant.last_update_ts) as i128;
+    let mut delta = (elapsed * grant.flow_rate) / SCALING_FACTOR;
+
+    // Apply Warmup multiplier if applicable
+    if grant.warmup_duration > 0 {
+        let multiplier = calculate_multiplier(grant, now);
+        delta = (delta * multiplier) / 10000;
+    }
+
+    let remaining = grant.total_amount - (grant.withdrawn + grant.claimable);
+    if delta > remaining { delta = remaining; }
+
+    grant.claimable += delta;
+    grant.last_update_ts = now;
+    Ok(())
+}
+
+fn calculate_multiplier(grant: &Grant, now: u64) -> i128 {
+    let end = grant.start_time + grant.warmup_duration;
+    if now >= end { return 10000; }
     if now <= grant.start_time { return 2500; }
     let progress = ((now - grant.start_time) as i128 * 10000) / (grant.warmup_duration as i128);
     2500 + (7500 * progress / 10000)
