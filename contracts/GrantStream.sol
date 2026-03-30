@@ -200,8 +200,25 @@ contract GrantStream is Ownable, ReentrancyGuard {
         address recipient, 
         uint256 _endDate,
         bool _finalReleaseRequired
-    ) external payable nonReentrant returns (uint256 grantId) {
-        require(msg.value > 0, "GrantStream: no funds");
+    ) external payable nonReentrant returns (uint256) {
+        return _createGrant(recipient, msg.value, _endDate, _finalReleaseRequired);
+    }
+
+    /**
+     * @notice Backward-compatible createGrant without final release parameters.
+     * @param recipient Address that will receive streamed funds.
+     */
+    function createGrant(address recipient) external payable nonReentrant returns (uint256) {
+        return _createGrant(recipient, msg.value, 0, false);
+    }
+
+    function _createGrant(
+        address recipient,
+        uint256 amount,
+        uint256 _endDate,
+        bool _finalReleaseRequired
+    ) private returns (uint256 grantId) {
+        require(amount > 0, "GrantStream: no funds");
         require(recipient != address(0), "GrantStream: zero recipient");
         if (kycRequired) {
             require(zkVerifier.isVerified(recipient), "GrantStream: recipient not KYC verified");
@@ -211,7 +228,7 @@ contract GrantStream is Ownable, ReentrancyGuard {
         grants[grantId] = Grant({
             funder:               msg.sender,
             recipient:            recipient,
-            balance:              msg.value,
+            balance:              amount,
             totalVolume:          0,
             active:               true,
             finalReleaseRequired: _finalReleaseRequired,
@@ -220,18 +237,10 @@ contract GrantStream is Ownable, ReentrancyGuard {
             exists:               true
         });
 
-        emit GrantCreated(grantId, msg.sender, recipient, msg.value);
+        emit GrantCreated(grantId, msg.sender, recipient, amount);
         if (_finalReleaseRequired) {
             emit FinalReleaseFlagSet(grantId, true);
         }
-    }
-
-    /**
-     * @notice Backward-compatible createGrant without final release parameters.
-     * @param recipient Address that will receive streamed funds.
-     */
-    function createGrant(address recipient) external payable nonReentrant returns (uint256 grantId) {
-        return createGrant(recipient, 0, false);
     }
 
     /**

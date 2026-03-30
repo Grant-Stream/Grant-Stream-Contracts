@@ -61,7 +61,7 @@ contract GrantConsolidator is Ownable, ReentrancyGuard {
         require(!grantDetails[grantId].exists, "GrantConsolidator: grant already added");
         
         // Fetch grant info from GrantStream
-        (address funder, address recipient, , , bool active) = grantStream.grants(grantId);
+        (address funder, address recipient, , , bool active, , , , ) = grantStream.grants(grantId);
         
         require(active, "GrantConsolidator: grant not active");
         require(recipient == address(this), "GrantConsolidator: consolidator not recipient");
