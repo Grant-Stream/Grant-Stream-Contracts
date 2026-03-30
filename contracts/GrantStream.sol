@@ -44,6 +44,10 @@ contract GrantStream is Ownable, ReentrancyGuard {
         uint256 balance;          // remaining claimable balance
         uint256 totalVolume;      // cumulative amount ever streamed / claimed
         bool    active;
+        bool    finalReleaseRequired;  // Flag: last 10% requires community approval
+        bool    finalReleaseApproved;  // Flag: community has approved final release
+        uint256 endDate;          // Grant stream end date
+        bool    exists;           // Flag to track if grant exists
     }
 
     uint256 public nextGrantId;
@@ -57,6 +61,9 @@ contract GrantStream is Ownable, ReentrancyGuard {
     event GrantClosed(uint256 indexed grantId, uint256 refunded);
     event ZKVerifierSet(address indexed zkVerifier);
     event KYCRequirementChanged(bool required);
+    event FinalReleaseFlagSet(uint256 indexed grantId, bool required);
+    event FinalReleaseApproved(uint256 indexed grantId, address indexed approver, uint256 timestamp);
+    event FinalReleaseClaimed(uint256 indexed grantId, address indexed recipient, uint256 amount);
 
     // ─── Constructor ──────────────────────────────────────────────────────────
 
@@ -93,7 +100,17 @@ contract GrantStream is Ownable, ReentrancyGuard {
         emit KYCRequirementChanged(_required);
     }
 
-    function createGrant(address recipient) external payable nonReentrant returns (uint256 grantId) {
+    /**
+     * @notice Create a new grant by depositing ETH.
+     * @param recipient Address that will receive streamed funds.
+     * @param _endDate Timestamp when the grant stream ends (0 for no end date).
+     * @param _finalReleaseRequired Whether the last 10% requires community approval.
+     */
+    function createGrant(
+        address recipient, 
+        uint256 _endDate,
+        bool _finalReleaseRequired
+    ) external payable nonReentrant returns (uint256 grantId) {
         require(msg.value > 0, "GrantStream: no funds");
         require(recipient != address(0), "GrantStream: zero recipient");
         if (kycRequired) {
@@ -102,19 +119,35 @@ contract GrantStream is Ownable, ReentrancyGuard {
 
         grantId = nextGrantId++;
         grants[grantId] = Grant({
-            funder:      msg.sender,
-            recipient:   recipient,
-            balance:     msg.value,
-            totalVolume: 0,
-            active:      true
+            funder:               msg.sender,
+            recipient:            recipient,
+            balance:              msg.value,
+            totalVolume:          0,
+            active:               true,
+            finalReleaseRequired: _finalReleaseRequired,
+            finalReleaseApproved: false,
+            endDate:              _endDate,
+            exists:               true
         });
 
         emit GrantCreated(grantId, msg.sender, recipient, msg.value);
+        if (_finalReleaseRequired) {
+            emit FinalReleaseFlagSet(grantId, true);
+        }
+    }
+
+    /**
+     * @notice Backward-compatible createGrant without final release parameters.
+     * @param recipient Address that will receive streamed funds.
+     */
+    function createGrant(address recipient) external payable nonReentrant returns (uint256 grantId) {
+        return createGrant(recipient, 0, false);
     }
 
     /**
      * @notice Recipient claims `amount` from their grant.
      *         Applies the 0.01% sustainability tax when cumulative volume >= VOLUME_THRESHOLD.
+     *         If finalReleaseRequired is enabled and grant has ended, last 10% requires community approval.
      */
     function claim(uint256 grantId, uint256 amount) external nonReentrant {
         Grant storage grant = grants[grantId];
@@ -123,6 +156,19 @@ contract GrantStream is Ownable, ReentrancyGuard {
         require(amount > 0 && amount <= grant.balance, "GrantStream: invalid amount");
         if (kycRequired) {
             require(zkVerifier.isVerified(msg.sender), "GrantStream: recipient not KYC verified");
+        }
+
+        // Check if this is the final 10% and requires community handshake
+        uint256 remainingBalance = grant.balance;
+        uint256 tenPercentOfOriginal = (grant.totalVolume + remainingBalance) / 10;
+        
+        // If final release is required, grant has ended, and this is the last 10%
+        if (grant.finalReleaseRequired && 
+            grant.endDate > 0 && 
+            block.timestamp > grant.endDate &&
+            amount <= tenPercentOfOriginal &&
+            !grant.finalReleaseApproved) {
+            revert("GrantStream: Last 10% requires community approval vote");
         }
 
         grant.balance     -= amount;
@@ -140,6 +186,11 @@ contract GrantStream is Ownable, ReentrancyGuard {
         (bool ok, ) = grant.recipient.call{value: net}("");
         require(ok, "GrantStream: transfer failed");
 
+        // Check if this was the final release
+        if (grant.finalReleaseRequired && grant.balance == 0) {
+            emit FinalReleaseClaimed(grantId, grant.recipient, amount);
+        }
+
         emit FundsClaimed(grantId, grant.recipient, net, tax);
     }
 
@@ -154,6 +205,27 @@ contract GrantStream is Ownable, ReentrancyGuard {
 
         grant.balance += msg.value;
         emit GrantToppedUp(grantId, msg.value);
+    }
+
+    /**
+     * @notice Community governance approves the final release for grants with finalReleaseRequired flag.
+     *         This allows the last 10% to be claimed after a successful project launch vote.
+     * @param grantId ID of the grant to approve.
+     */
+    function approveFinalRelease(uint256 grantId) external nonReentrant {
+        Grant storage grant = grants[grantId];
+        require(grant.finalReleaseRequired, "GrantStream: Final release not required for this grant");
+        require(!grant.finalReleaseApproved, "GrantStream: Final release already approved");
+        require(grant.endDate > 0 && block.timestamp > grant.endDate, 
+                "GrantStream: Grant has not ended yet");
+        
+        // In a full implementation, this would check DAO voting power
+        // For now, we use a simple owner-based approval as placeholder
+        // A real implementation would integrate with a DAO governance contract
+        require(msg.sender == owner(), "GrantStream: Only owner/governance can approve final release");
+        
+        grant.finalReleaseApproved = true;
+        emit FinalReleaseApproved(grantId, msg.sender, block.timestamp);
     }
 
     /**
@@ -210,5 +282,28 @@ contract GrantStream is Ownable, ReentrancyGuard {
         }
 
         tax = (taxableAmount * SUSTAINABILITY_TAX_BPS) / BPS_DENOMINATOR;
+    }
+
+    /**
+     * @notice Get detailed grant information including final release status.
+     * @param grantId ID of the grant.
+     * @return Grant details with final release flags.
+     */
+    function getGrantDetails(uint256 grantId) external view returns (Grant memory) {
+        require(grants[grantId].exists || grantId < nextGrantId, "GrantStream: Grant does not exist");
+        return grants[grantId];
+    }
+
+    /**
+     * @notice Check if a grant requires final community approval for the last 10%.
+     * @param grantId ID of the grant.
+     * @return True if final release is required and not yet approved.
+     */
+    function requiresFinalApproval(uint256 grantId) external view returns (bool) {
+        Grant storage grant = grants[grantId];
+        return grant.finalReleaseRequired && 
+               !grant.finalReleaseApproved && 
+               grant.endDate > 0 && 
+               block.timestamp > grant.endDate;
     }
 }
