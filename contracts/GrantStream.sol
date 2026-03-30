@@ -76,6 +76,7 @@ contract GrantStream is Ownable, ReentrancyGuard {
     event FundsClaimed(uint256 indexed grantId, address indexed recipient, uint256 netAmount, uint256 sustainabilityTax);
     event GrantToppedUp(uint256 indexed grantId, uint256 amount);
     event GrantClosed(uint256 indexed grantId, uint256 refunded);
+    event GrantRecipientUpdated(uint256 indexed grantId, address indexed oldRecipient, address indexed newRecipient);
     event ZKVerifierSet(address indexed zkVerifier);
     event KYCRequirementChanged(bool required);
     event FinalReleaseFlagSet(uint256 indexed grantId, bool required);
@@ -199,8 +200,25 @@ contract GrantStream is Ownable, ReentrancyGuard {
         address recipient, 
         uint256 _endDate,
         bool _finalReleaseRequired
-    ) external payable nonReentrant returns (uint256 grantId) {
-        require(msg.value > 0, "GrantStream: no funds");
+    ) external payable nonReentrant returns (uint256) {
+        return _createGrant(recipient, msg.value, _endDate, _finalReleaseRequired);
+    }
+
+    /**
+     * @notice Backward-compatible createGrant without final release parameters.
+     * @param recipient Address that will receive streamed funds.
+     */
+    function createGrant(address recipient) external payable nonReentrant returns (uint256) {
+        return _createGrant(recipient, msg.value, 0, false);
+    }
+
+    function _createGrant(
+        address recipient,
+        uint256 amount,
+        uint256 _endDate,
+        bool _finalReleaseRequired
+    ) private returns (uint256 grantId) {
+        require(amount > 0, "GrantStream: no funds");
         require(recipient != address(0), "GrantStream: zero recipient");
         if (kycRequired) {
             require(zkVerifier.isVerified(recipient), "GrantStream: recipient not KYC verified");
@@ -210,7 +228,7 @@ contract GrantStream is Ownable, ReentrancyGuard {
         grants[grantId] = Grant({
             funder:               msg.sender,
             recipient:            recipient,
-            balance:              msg.value,
+            balance:              amount,
             totalVolume:          0,
             active:               true,
             finalReleaseRequired: _finalReleaseRequired,
@@ -219,18 +237,10 @@ contract GrantStream is Ownable, ReentrancyGuard {
             exists:               true
         });
 
-        emit GrantCreated(grantId, msg.sender, recipient, msg.value);
+        emit GrantCreated(grantId, msg.sender, recipient, amount);
         if (_finalReleaseRequired) {
             emit FinalReleaseFlagSet(grantId, true);
         }
-    }
-
-    /**
-     * @notice Backward-compatible createGrant without final release parameters.
-     * @param recipient Address that will receive streamed funds.
-     */
-    function createGrant(address recipient) external payable nonReentrant returns (uint256 grantId) {
-        return createGrant(recipient, 0, false);
     }
 
     /**
@@ -386,6 +396,23 @@ contract GrantStream is Ownable, ReentrancyGuard {
         }
 
         emit GrantClosed(grantId, refund);
+    }
+
+    /**
+     * @notice Allows the current recipient to transfer the grant to a new recipient.
+     *         This is useful for moving grants into a Management Vault or Consolidator.
+     * @param grantId ID of the grant to update.
+     * @param newRecipient Address of the new recipient.
+     */
+    function updateRecipient(uint256 grantId, address newRecipient) external nonReentrant {
+        Grant storage grant = grants[grantId];
+        require(grant.active, "GrantStream: inactive grant");
+        require(msg.sender == grant.recipient, "GrantStream: not current recipient");
+        require(newRecipient != address(0), "GrantStream: zero recipient address");
+
+        address oldRecipient = grant.recipient;
+        grant.recipient = newRecipient;
+        emit GrantRecipientUpdated(grantId, oldRecipient, newRecipient);
     }
 
     // ─── Internal ─────────────────────────────────────────────────────────────
