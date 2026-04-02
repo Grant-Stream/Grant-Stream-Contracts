@@ -67,8 +67,32 @@ contract GrantStream is Ownable, ReentrancyGuard {
         bool    exists;           // Flag to track if grant exists
     }
 
+    /**
+     * @dev Hot-path status cache packed into ONE storage slot (32 bytes):
+     *   recipient  : 20 bytes
+     *   active     :  1 byte   (bool)
+     *   finalReqd  :  1 byte   (bool)
+     *   finalApprv :  1 byte   (bool)
+     *   exists     :  1 byte   (bool)
+     *   endDate    :  5 bytes  (uint40 — enough until year 36,812)
+     *   _pad       :  3 bytes  (unused, keeps slot tight)
+     *
+     * Total: 31 bytes → fits in one 32-byte slot.
+     * getStreamStatus() reads ONLY this mapping: 1 SLOAD per call.
+     */
+    struct StreamStatus {
+        address recipient;   // 20 bytes
+        bool    active;      //  1 byte  } packed by Solidity into the same slot
+        bool    finalReleaseRequired; // 1 byte
+        bool    finalReleaseApproved; // 1 byte
+        bool    exists;      //  1 byte
+        uint40  endDate;     //  5 bytes (covers dates to year 36,812)
+    }
+
     uint256 public nextGrantId;
-    mapping(uint256 => Grant) public grants;
+    mapping(uint256 => Grant)        public grants;
+    /// @dev Single-slot status cache — updated in sync with `grants` on every write.
+    mapping(uint256 => StreamStatus) public streamStatus;
 
     // ─── Events ───────────────────────────────────────────────────────────────
 
@@ -237,6 +261,16 @@ contract GrantStream is Ownable, ReentrancyGuard {
             exists:               true
         });
 
+        // Populate single-slot status cache (1 SSTORE, enables 1-SLOAD reads later)
+        streamStatus[grantId] = StreamStatus({
+            recipient:            recipient,
+            active:               true,
+            finalReleaseRequired: _finalReleaseRequired,
+            finalReleaseApproved: false,
+            exists:               true,
+            endDate:              uint40(_endDate)
+        });
+
         emit GrantCreated(grantId, msg.sender, recipient, amount);
         if (_finalReleaseRequired) {
             emit FinalReleaseFlagSet(grantId, true);
@@ -375,6 +409,7 @@ contract GrantStream is Ownable, ReentrancyGuard {
         require(msg.sender == owner(), "GrantStream: Only owner/governance can approve final release");
         
         grant.finalReleaseApproved = true;
+        streamStatus[grantId].finalReleaseApproved = true;   // sync cache
         emit FinalReleaseApproved(grantId, msg.sender, block.timestamp);
     }
 
@@ -387,6 +422,7 @@ contract GrantStream is Ownable, ReentrancyGuard {
         require(msg.sender == grant.funder, "GrantStream: not funder");
 
         grant.active = false;
+        streamStatus[grantId].active = false;   // sync cache
         uint256 refund = grant.balance;
         grant.balance = 0;
 
@@ -472,6 +508,47 @@ contract GrantStream is Ownable, ReentrancyGuard {
                !grant.finalReleaseApproved && 
                grant.endDate > 0 && 
                block.timestamp > grant.endDate;
+    }
+
+    // ─── Optimized Status Reads (1 SLOAD each) ───────────────────────────────
+
+    /**
+     * @notice Returns the hot-path status of a grant in a single ledger read.
+     *         Costs exactly 1 SLOAD regardless of how many fields are returned,
+     *         because all fields are packed into one 32-byte storage slot.
+     *         Use this instead of getGrantDetails() during high-traffic payday events.
+     * @param grantId Grant to query.
+     */
+    function getStreamStatus(uint256 grantId)
+        external view
+        returns (
+            address recipient,
+            bool    active,
+            bool    finalReleaseRequired,
+            bool    finalReleaseApproved,
+            bool    exists,
+            uint40  endDate
+        )
+    {
+        StreamStatus storage s = streamStatus[grantId]; // 1 SLOAD
+        return (s.recipient, s.active, s.finalReleaseRequired, s.finalReleaseApproved, s.exists, s.endDate);
+    }
+
+    /**
+     * @notice Batch version of getStreamStatus — N grants, N SLOADs.
+     *         Designed for "Payday" events where hundreds of grantees query
+     *         simultaneously; avoids the overhead of N full Grant struct reads.
+     * @param grantIds Array of grant IDs to query.
+     */
+    function batchGetStreamStatus(uint256[] calldata grantIds)
+        external view
+        returns (StreamStatus[] memory statuses)
+    {
+        statuses = new StreamStatus[](grantIds.length);
+        for (uint256 i; i < grantIds.length; ) {
+            statuses[i] = streamStatus[grantIds[i]]; // 1 SLOAD per grant
+            unchecked { ++i; }
+        }
     }
 
     // ─── Wasm-Rotation Hook ───────────────────────────────────────────────────
