@@ -258,6 +258,25 @@ contract GrantStreamWithArbitration is Ownable, ReentrancyGuard {
         Grant memory grant = grants[grantId];
         return grant.exists ? grant.activeDisputeId : 0;
     }
+
+    // ─── Wasm-Rotation Hook ───────────────────────────────────────────────────
+
+    /**
+     * @notice Proxy spot-check: confirms this logic version agrees with the
+     *         immutable terms stored in GrantStreamProxy for a given grant.
+     */
+    function verifyImmutableTerms(
+        uint256 grantId,
+        address funder,
+        address recipient,
+        uint256 totalAmount
+    ) external view returns (bool) {
+        Grant storage g = grants[grantId];
+        if (!g.exists) return false;
+        return g.funder    == funder    &&
+               g.recipient == recipient &&
+               (g.balance + g.totalVolume) == totalAmount;
+    }
     
     // ─── Internal Functions ─────────────────────────────────────────────────────
     
