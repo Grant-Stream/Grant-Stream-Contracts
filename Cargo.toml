@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["contracts/grant_contracts", "contracts/vesting_contracts"]
+
+[workspace.dependencies]
+soroban-sdk = "22.0.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
